@@ -1,0 +1,12 @@
+usart_test\list.o: ..\FreeRTOS\source\list.c
+usart_test\list.o: C:\Keil_v5\ARM\ARMCC\Bin\..\include\stdlib.h
+usart_test\list.o: ../FreeRTOS/include/FreeRTOS.h
+usart_test\list.o: C:\Keil_v5\ARM\ARMCC\Bin\..\include\stddef.h
+usart_test\list.o: C:\Keil_v5\ARM\ARMCC\Bin\..\include\stdint.h
+usart_test\list.o: ../Core/Inc/FreeRTOSConfig.h
+usart_test\list.o: ../FreeRTOS/include/projdefs.h
+usart_test\list.o: ../FreeRTOS/include/portable.h
+usart_test\list.o: ../FreeRTOS/include/deprecated_definitions.h
+usart_test\list.o: ../FreeRTOS/portable/ARM_CM3/portmacro.h
+usart_test\list.o: ../FreeRTOS/include/mpu_wrappers.h
+usart_test\list.o: ../FreeRTOS/include/list.h

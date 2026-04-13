@@ -1,0 +1,15 @@
+usart_test\event_groups.o: ..\FreeRTOS\source\event_groups.c
+usart_test\event_groups.o: C:\Keil_v5\ARM\ARMCC\Bin\..\include\stdlib.h
+usart_test\event_groups.o: ../FreeRTOS/include/FreeRTOS.h
+usart_test\event_groups.o: C:\Keil_v5\ARM\ARMCC\Bin\..\include\stddef.h
+usart_test\event_groups.o: C:\Keil_v5\ARM\ARMCC\Bin\..\include\stdint.h
+usart_test\event_groups.o: ../Core/Inc/FreeRTOSConfig.h
+usart_test\event_groups.o: ../FreeRTOS/include/projdefs.h
+usart_test\event_groups.o: ../FreeRTOS/include/portable.h
+usart_test\event_groups.o: ../FreeRTOS/include/deprecated_definitions.h
+usart_test\event_groups.o: ../FreeRTOS/portable/ARM_CM3/portmacro.h
+usart_test\event_groups.o: ../FreeRTOS/include/mpu_wrappers.h
+usart_test\event_groups.o: ../FreeRTOS/include/task.h
+usart_test\event_groups.o: ../FreeRTOS/include/list.h
+usart_test\event_groups.o: ../FreeRTOS/include/timers.h
+usart_test\event_groups.o: ../FreeRTOS/include/event_groups.h

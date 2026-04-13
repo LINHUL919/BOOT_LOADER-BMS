@@ -1,0 +1,1 @@
+p02_boot_loader\startup_stm32f407xx.o: startup_stm32f407xx.s

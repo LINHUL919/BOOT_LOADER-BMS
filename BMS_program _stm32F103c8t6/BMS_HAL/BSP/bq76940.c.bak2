@@ -1,0 +1,1465 @@
+/**
+ * @file    bq76940.c
+ * @brief   BQ76940鐢垫睜绠＄悊鑺墖椹卞姩瀹炵幇 (HAL搴撶増鏈?
+ * @note    绉绘鑷師宸ョ▼ BSP/BQ76930.c
+ *
+ *          銆愬師浠ｇ爜鏁版嵁閲囬泦娴佺▼銆?
+ *          涓诲惊鐜腑璋冪敤 Get_Update_Data(), 鍐呴儴渚濇鎵ц:
+ *            Get_Battery1()~15()   -> 閫愯妭璇诲彇15鑺傜數鍘?
+ *            Get_Update_ALL_Data() -> 绱姞鎬荤數鍘?
+ *            Get_BQ1_2_Temp()      -> 璇籒TC娓╁害
+ *            Get_BQ_Current()      -> 璇诲簱浠戣鐢垫祦
+ *
+ *          銆愮數鍘嬭绠楀叕寮忋€?
+ *          voltage_mV = (raw_adc * GAIN) / 1000 + ADC_offset
+ *          GAIN = 365 + adc_gain_bits (uV), 鍏稿瀷鍊肩害377
+ *
+ *          銆怚2C閫氫俊鍗忚銆?
+ *          鍐?甯RC): START->0x10->reg->data->CRC8->STOP
+ *          璇?鏃燙RC): START->0x10->reg->RESTART->0x11->璇?瀛楄妭->STOP
+ *          CRC8澶氶」寮? key=7
+ */
+
+/* Includes ------------------------------------------------------------------*/
+#include "bq76940.h"
+#include "bms_soc.h"
+#include "sw_i2c.h"
+#include "usart.h"
+#include <stdio.h>
+#include <string.h>
+#include <math.h>
+
+/* FreeRTOS 鈥?鐢ㄤ簬 vTaskDelay 鍜?xTaskNotifyFromISR */
+#include "FreeRTOS.h"
+#include "task.h"
+
+/* 鍏ㄥ眬BMS鏁版嵁缁撴瀯 */
+BQ76940_Data_t bms_data;
+
+/* ==================== ALERT 涓柇閫氱煡 ==================== */
+volatile uint8_t g_bq_alert_flag = 0;
+static TaskHandle_t s_alert_task = NULL;  /* BMS_Task鍙ユ焺, 鐢ㄤ簬ISR鐩存帴鍞ら啋 */
+
+/**
+ * @brief  娉ㄥ唽鎺ユ敹ALERT閫氱煡鐨勪换鍔?
+ * @param  handle  BMS_Task鐨勪换鍔″彞鏌?(鍦╩ain.c涓垱寤哄悗璋冪敤)
+ */
+void BQ76940_SetAlertTask(void *handle)
+{
+    s_alert_task = (TaskHandle_t)handle;
+}
+
+/**
+ * @brief  鏅鸿兘寤舵椂: 璋冨害鍣ㄨ繍琛屾椂鐢╲TaskDelay閲婃斁CPU, 鍚﹀垯鐢℉AL_Delay
+ * @note   BQ76940_Init()鍦ㄨ皟搴﹀櫒鍚姩鍓?鍚庨兘鍙兘琚皟鐢?閲嶅垵濮嬪寲),
+ *         姝ゅ嚱鏁拌嚜鍔ㄩ€夋嫨鍚堥€傜殑寤舵椂鏂瑰紡
+ */
+static void BQ_Delay(uint32_t ms)
+{
+    if (xTaskGetSchedulerState() != taskSCHEDULER_NOT_STARTED)
+        vTaskDelay(pdMS_TO_TICKS(ms));
+    else
+        HAL_Delay(ms);
+}
+
+/**
+ * @brief  ALERT涓柇鍥炶皟 鈥?缃爣蹇?+ 浠诲姟閫氱煡
+ * @note   杞欢I2C涓嶈兘鍦ㄤ腑鏂腑浣跨敤, 瀹為檯澶勭悊鍦˙MS_Task
+ */
+void BQ76940_AlertCallback(void)
+{
+    g_bq_alert_flag = 1;
+
+    /* 濡傛灉宸叉敞鍐孊MS_Task, 閫氳繃浠诲姟閫氱煡绔嬪嵆鍞ら啋 (鏃犻渶绛?00ms杞) */
+    if (s_alert_task != NULL) {
+        BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+        vTaskNotifyGiveFromISR(s_alert_task, &xHigherPriorityTaskWoken);
+        portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+    }
+}
+
+/**
+ * @brief  HAL GPIO EXTI鍥炶皟 (瑕嗙洊 __weak 鐗堟湰)
+ *         PB2 涓嬮檷娌?鈫?BQ76940 ALERT瑙﹀彂
+ */
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
+{
+    if (GPIO_Pin == GPIO_PIN_2) {
+        BQ76940_AlertCallback();
+    }
+}
+
+/* ===================== I2C閫氫俊鍋ュ悍缁熻 ===================== */
+static volatile uint32_t g_bq_ack_fail_total = 0;
+static volatile uint16_t g_bq_ack_fail_continuous = 0;
+static volatile uint8_t g_bq_last_transfer_ok = 1;
+
+static uint32_t g_bq_last_reinit_tick = 0; /* 涓婃閲嶅垵濮嬪寲鐨勬椂鍒?ms) */
+static uint16_t g_bq_reinit_count = 0;     /* 绱閲嶅垵濮嬪寲娆℃暟 */
+
+/* 鍓嶇疆澹版槑: 閬垮厤鍦ㄩ娆¤皟鐢ㄦ椂鍑虹幇闅愬紡澹版槑 */
+static void BQ_WriteReg(uint8_t reg, uint8_t data);
+static uint8_t BQ_ReadReg(uint8_t reg);
+static void BQ_CellFilterReset(uint8_t idx, int seed_mv);
+static void BQ_TempFilterReset(float seed_temp);
+
+static void BQ76940_CommRecord(uint8_t ok)
+{
+    if (ok)
+    {
+        g_bq_last_transfer_ok = 1;
+        g_bq_ack_fail_continuous = 0;
+    }
+    else
+    {
+        g_bq_last_transfer_ok = 0;
+        g_bq_ack_fail_total++;
+        if (g_bq_ack_fail_continuous < 0xFFFFU)
+        {
+            g_bq_ack_fail_continuous++;
+        }
+    }
+}
+
+void BQ76940_CommHealthReset(void)
+{
+    g_bq_ack_fail_total = 0;
+    g_bq_ack_fail_continuous = 0;
+    g_bq_last_transfer_ok = 1;
+}
+
+void BQ76940_CommHealthGet(BQ76940_CommHealth_t *info)
+{
+    if (info == NULL)
+        return;
+    info->ack_fail_total = g_bq_ack_fail_total;
+    info->ack_fail_continuous = g_bq_ack_fail_continuous;
+    info->last_transfer_ok = g_bq_last_transfer_ok;
+    info->reinit_count = g_bq_reinit_count; /* 鏂板 */
+}
+
+/**
+ * @brief  閫氫俊鍋ュ悍妫€鏌?+ 鑷姩鎭㈠
+ * @note   鍦ㄤ富寰幆涓? 姣忔璋冪敤 BQ76940_UpdateAll() 涔嬪墠璋冪敤鏈嚱鏁?
+ *
+ *         宸ヤ綔閫昏緫:
+ *           1. 璇诲彇褰撳墠杩炵画澶辫触娆℃暟
+ *           2. 濡傛灉 < BQ_COMM_FAIL_THRESHOLD, 杩斿洖1(姝ｅ父)
+ *           3. 濡傛灉 >= 闃堝€? 妫€鏌ヨ窛涓婃閲嶅垵濮嬪寲鏄惁瓒呰繃鏈€灏忛棿闅?
+ *           4. 瓒呰繃闂撮殧 -> 鎵ц瀹屾暣閲嶅垵濮嬪寲娴佺▼ -> 杩斿洖0(鏈疆璺宠繃)
+ *           5. 鏈秴杩囬棿闅?-> 杩斿洖0(绛夊緟, 涓嶉噸澶嶉噸鍚?
+ *
+ *         閲嶅垵濮嬪寲娴佺▼涓?BQ76940_Init() 瀹屽叏涓€鑷?
+ *           鍞ら啋鑴夊啿 -> 瀵勫瓨鍣ㄥ啓鍏?-> 璇绘牎鍑?-> 璁句繚鎶?-> 娓呯姸鎬?
+ *
+ *         瀵瑰簲鍘熶唬鐮佷腑娌℃湁鐨勫姛鑳? 杩欐槸鍏ㄦ柊澧炲姞鐨勫畨鍏ㄦ満鍒?
+ */
+uint8_t BQ76940_CommCheck(void)
+{
+    /* 杩炵画澶辫触娆℃暟鏈揪闃堝€? 閫氫俊姝ｅ父 */
+    if (g_bq_ack_fail_continuous < BQ_COMM_FAIL_THRESHOLD)
+    {
+        return 1;
+    }
+
+    /* 杈惧埌闃堝€? 妫€鏌ユ槸鍚﹀厑璁搁噸鍒濆鍖?(闃叉楂橀鍙嶅閲嶅惎) */
+    uint32_t now = HAL_GetTick();
+    if ((now - g_bq_last_reinit_tick) < BQ_REINIT_MIN_INTERVAL)
+    {
+        return 0; /* 璺濅笂娆￠噸鍒濆鍖栧お杩? 绛変竴绛?*/
+    }
+
+    /* ---- 鎵ц閲嶅垵濮嬪寲 ---- */
+    g_bq_last_reinit_tick = now;
+    g_bq_reinit_count++;
+
+    /* 鍏堥噸缃粺璁? 閬垮厤閲嶅垵濮嬪寲杩囩▼涓啀娆¤Е鍙?*/
+    BQ76940_CommHealthReset();
+
+    /* 瀹屾暣閲嶅垵濮嬪寲娴佺▼ (涓?BQ76940_Init 涓€鑷? */
+    BQ76940_Init();
+
+    return 0; /* 鏈疆鍒氶噸鍒濆鍖? 璺宠繃閲囬泦, 涓嬭疆鍐嶈鏁版嵁 */
+}
+
+/* ===================== MOS绠℃帶鍒?=====================
+ * 瀵瑰簲鍘熶唬鐮?BQ76930.c 涓殑:
+ *   BMS_STA()         -> 璇籗YS_CTRL2鑾峰彇褰撳墠MOS鐘舵€?
+ *   Only_Open_CHG()   -> 寮€鍏呯數
+ *   Only_Close_CHG()  -> 鍏冲厖鐢?
+ *   Only_Open_DSG()   -> 寮€鏀剧數
+ *   Only_Close_DSG()  -> 鍏虫斁鐢?
+ *   Open_DSG_CHG()    -> 鍏ㄥ紑
+ *   Close_DSG_CHG()   -> 鍏ㄥ叧
+ *
+ * 鍘熶唬鐮佹瘡娆℃搷浣滃墠璋冪敤BMS_STA()璇诲瘎瀛樺櫒鑾峰彇褰撳墠鐘舵€?
+ * 鐒跺悗鏍规嵁鍙︿竴涓狹OS鐨勭姸鎬佸喅瀹氬啓鍏ュ€? 淇濊瘉涓嶄簰鐩稿奖鍝?
+ *
+ * 杩欓噷缁熶竴鐢ㄤ竴涓唴閮ㄥ嚱鏁拌鐘舵€? 6涓閮ㄥ嚱鏁板垎鍒搷浣?
+ * ===================================================== */
+
+/**
+ * @brief  璇诲彇SYS_CTRL2, 鏇存柊bms_data涓殑MOS鐘舵€?
+ * @note   瀵瑰簲鍘熶唬鐮?BMS_STA()
+ *         鍘熶唬鐮? BMS_sta = IIC1_read_one_byte(SYS_CTRL2);
+ *                 DSG_STA = BMS_sta & 0x02;
+ *                 CHG_STA = BMS_sta & 0x01;
+ */
+static void BQ_ReadMosStatus(void)
+{
+    uint8_t reg = BQ_ReadReg(REG_SYS_CTRL2);
+    bms_data.dsg_on = (reg & 0x02) ? 1 : 0;
+    bms_data.chg_on = (reg & 0x01) ? 1 : 0;
+}
+
+/**
+ * @brief  鎵撳紑鍏呯數MOS, 淇濇寔鏀剧數MOS涓嶅彉
+ * @note   瀵瑰簲鍘熶唬鐮?Only_Open_CHG():
+ *           if(DSG_STA!=0) write(0x43); else write(0x41);
+ */
+void BQ76940_OpenCHG(void)
+{
+    BQ_WriteReg(REG_SYS_STAT, 0xFF);   /* 娓呴櫎鍛婅鏍囧織, 鍚﹀垯BQ76940鎷掔粷寮€FET */
+    BQ_ReadMosStatus();
+    if (bms_data.dsg_on)
+    {
+        BQ_WriteReg(REG_SYS_CTRL2, 0x43); /* DSG=1 CHG=1 */
+    }
+    else
+    {
+        BQ_WriteReg(REG_SYS_CTRL2, 0x41); /* DSG=0 CHG=1 */
+    }
+}
+
+/**
+ * @brief  鍏抽棴鍏呯數MOS, 淇濇寔鏀剧數MOS涓嶅彉
+ * @note   瀵瑰簲鍘熶唬鐮?Only_Close_CHG():
+ *           if(DSG_STA!=0) write(0x42); else write(0x40);
+ */
+void BQ76940_CloseCHG(void)
+{
+    BQ_ReadMosStatus();
+    if (bms_data.dsg_on)
+    {
+        BQ_WriteReg(REG_SYS_CTRL2, 0x42); /* DSG=1 CHG=0 */
+    }
+    else
+    {
+        BQ_WriteReg(REG_SYS_CTRL2, 0x40); /* DSG=0 CHG=0 */
+    }
+    /* 涓嶅啀娓呭潎琛?鈥?鎵嬪姩鍏矯HG涓嶅簲褰卞搷鍧囪　, 淇濇姢娓呭潎琛″湪BQ_CheckXX涓?*/
+}
+
+/**
+ * @brief  鎵撳紑鏀剧數MOS, 淇濇寔鍏呯數MOS涓嶅彉
+ * @note   瀵瑰簲鍘熶唬鐮?Only_Open_DSG():
+ *           if(CHG_STA!=0) write(0x43); else write(0x42);
+ */
+void BQ76940_OpenDSG(void)
+{
+    BQ_WriteReg(REG_SYS_STAT, 0xFF);   /* 娓呴櫎鍛婅鏍囧織, 鍚﹀垯BQ76940鎷掔粷寮€FET */
+    BQ_ReadMosStatus();
+    if (bms_data.chg_on)
+    {
+        BQ_WriteReg(REG_SYS_CTRL2, 0x43); /* DSG=1 CHG=1 */
+    }
+    else
+    {
+        BQ_WriteReg(REG_SYS_CTRL2, 0x42); /* DSG=1 CHG=0 */
+    }
+}
+
+/**
+ * @brief  鍏抽棴鏀剧數MOS, 淇濇寔鍏呯數MOS涓嶅彉
+ * @note   瀵瑰簲鍘熶唬鐮?Only_Close_DSG():
+ *           if(CHG_STA!=0) write(0x41); else write(0x40);
+ */
+void BQ76940_CloseDSG(void)
+{
+    BQ_ReadMosStatus();
+    if (bms_data.chg_on)
+    {
+        BQ_WriteReg(REG_SYS_CTRL2, 0x41); /* DSG=0 CHG=1 */
+    }
+    else
+    {
+        BQ_WriteReg(REG_SYS_CTRL2, 0x40); /* DSG=0 CHG=0 */
+    }
+    /* 涓嶅啀娓呭潎琛?鈥?鎵嬪姩鍏矰SG涓嶅簲褰卞搷鍧囪　, 淇濇姢娓呭潎琛″湪BQ_CheckXX涓?*/
+}
+
+/**
+ * @brief  鍚屾椂鎵撳紑鍏呯數+鏀剧數MOS
+ * @note   瀵瑰簲鍘熶唬鐮?Open_DSG_CHG(): write(0x43)
+ */
+void BQ76940_OpenAll(void)
+{
+    BQ_WriteReg(REG_SYS_STAT, 0xFF);   /* 娓呴櫎鍛婅鏍囧織, 鍚﹀垯BQ76940鎷掔粷寮€FET */
+    BQ_WriteReg(REG_SYS_CTRL2, 0x43); /* CC_EN=1 DSG=1 CHG=1 */
+}
+
+/**
+ * @brief  鍚屾椂鍏抽棴鍏呯數+鏀剧數MOS
+ * @note   瀵瑰簲鍘熶唬鐮?Close_DSG_CHG(): write(0x40)
+ */
+void BQ76940_CloseAll(void)
+{
+    BQ_WriteReg(REG_SYS_CTRL2, 0x40); /* CC_EN=1 DSG=0 CHG=0 */
+    /* 涓嶅啀娓呭潎琛?鈥?鎵嬪姩MOS鍏ㄥ叧涓嶅簲褰卞搷鍧囪　, 淇濇姢娓呭潎琛″湪BQ_CheckXX涓?*/
+}
+
+/* ==================== 淇濇姢閫昏緫 ====================
+ * 瀵瑰簲鍘熶唬鐮?main.c 涓诲惊鐜腑鐨勪繚鎶ゅ垽鏂?
+ *
+ * 鍘熶唬鐮佷繚鎶ら€昏緫鐗圭偣:
+ *   1. 杩囧帇: 鍙鏌ラ儴鍒嗙數鑺?0,1,4,5,6,9,10,11,14), 涓嶆槸鍏ㄩ儴15鑺?
+ *      -> 杩欓噷鏀硅繘涓烘鏌ュ叏閮?5鑺? 鏇村畨鍏?
+ *   2. 鎭㈠鍒ゆ柇: 鍘熶唬鐮佷篃鍙鏌ラ儴鍒嗙數鑺?
+ *      -> 杩欓噷鏀硅繘涓哄叏閮?5鑺傞兘婊¤冻鎵嶆仮澶?
+ *   3. 杩囨俯: 鍘熶唬鐮佷粠Flash璇婚槇鍊? 杩欓噷鍏堢敤瀹忓畾涔?
+ *      -> 骞跺鍔犲洖宸?OT_THRESHOLD鍜孫T_RECOVER涓嶅悓), 闃叉娓╁害鎶栧姩鍙嶅瑙﹀彂
+ *   4. 姣忔淇濇姢鍔ㄤ綔鍚庨兘娓匰YS_STAT, 涓庡師浠ｇ爜涓€鑷?
+ * ===================================================== */
+
+static BQ76940_Protection_t g_prot = {0};
+
+/* ==================== 绠€鍗曟粦鍔ㄥ钩鍧?鍘绘姈鐘舵€?====================
+ * 杩欎簺鍙橀噺浠呯敤浜庢护娉㈠唴閮? 涓嶅澶栨毚闇?
+ * ============================================================ */
+static int g_cell_hist[CELL_COUNT][BQ_FILTER_WINDOW_SIZE];
+static uint8_t g_cell_hist_cnt[CELL_COUNT];
+static uint8_t g_cell_hist_widx[CELL_COUNT];
+
+static float g_temp_hist[BQ_FILTER_WINDOW_SIZE];
+static uint8_t g_temp_hist_cnt = 0;
+static uint8_t g_temp_hist_widx = 0;
+
+/**
+ * @brief  杩囧帇淇濇姢妫€鏌?
+ * @note   瀵瑰簲鍘熶唬鐮?
+ *           if((Batteryval[0]>4200)||...澶氫釜鐢佃姱...) {
+ *               Only_Close_CHG();
+ *               IIC1_write_one_byte_CRC(SYS_STAT,0xFF);
+ *               OV_FLAG=1;
+ *           }
+ *           if(OV_FLAG==1) {
+ *               if((Batteryval[0]<4100)&&...鍏ㄩ儴鐢佃姱...) {
+ *                   Only_Open_CHG(); OV_FLAG=0;
+ *               }
+ *           }
+ */
+static void BQ_CheckOV(void)
+{
+    /* --- 瑙﹀彂妫€鏌? 浠讳竴鐢佃姱瓒呰繃闃堝€?--- */
+    if (!g_prot.ov_flag)
+    {
+        for (int i = 0; i < CELL_COUNT; i++)
+        {
+            if (bms_data.cell_mv[i] > BQ_OV_THRESHOLD)
+            {
+                BQ76940_CloseCHG();              /* 鍏冲厖鐢礛OS */
+                 BQ76940_ClearBalance();   /* 淇濇姢瑙﹀彂鏃跺仠姝㈠潎琛?*/
+                BQ_WriteReg(REG_SYS_STAT, 0xFF); /* 娓呯姸鎬?*/
+                g_prot.ov_flag = 1;
+                return;
+            }
+        }
+    }
+
+    /* --- 鎭㈠妫€鏌? 鍏ㄩ儴鐢佃姱浣庝簬鎭㈠闃堝€?--- */
+    if (g_prot.ov_flag)
+    {
+        for (int i = 0; i < CELL_COUNT; i++)
+        {
+            if (bms_data.cell_mv[i] >= BQ_OV_RECOVER)
+            {
+                return; /* 杩樻湁鐢佃姱娌￠檷涓嬫潵, 缁х画淇濇姢 */
+            }
+        }
+        /* 鍏ㄩ儴浣庝簬鎭㈠闃堝€? 瑙ｉ櫎淇濇姢 */
+        BQ76940_OpenCHG();
+        BQ_WriteReg(REG_SYS_STAT, 0xFF);
+        g_prot.ov_flag = 0;
+    }
+}
+
+/**
+ * @brief  娆犲帇淇濇姢妫€鏌?
+ * @note   瀵瑰簲鍘熶唬鐮?
+ *           if((Batteryval[0]<2800)||...) { Only_Close_DSG(); UV_FLAG=1; }
+ *           if(UV_FLAG==1) { if(鍏ㄩ儴>2800) { Only_Open_DSG(); UV_FLAG=0; } }
+ */
+static void BQ_CheckUV(void)
+{
+    if (!g_prot.uv_flag)
+    {
+        for (int i = 0; i < CELL_COUNT; i++)
+        {
+            if (bms_data.cell_mv[i] < BQ_UV_THRESHOLD)
+            {
+                BQ76940_CloseDSG();
+                 BQ76940_ClearBalance();   /* 淇濇姢瑙﹀彂鏃跺仠姝㈠潎琛?*/
+                BQ_WriteReg(REG_SYS_STAT, 0xFF);
+                g_prot.uv_flag = 1;
+                return;
+            }
+        }
+    }
+
+    if (g_prot.uv_flag)
+    {
+        for (int i = 0; i < CELL_COUNT; i++)
+        {
+            if (bms_data.cell_mv[i] <= BQ_UV_RECOVER)
+            {
+                return; /* 杩樻湁鐢佃姱娌℃仮澶?*/
+            }
+        }
+        BQ76940_OpenDSG();
+        BQ_WriteReg(REG_SYS_STAT, 0xFF);
+        g_prot.uv_flag = 0;
+    }
+}
+
+/**
+ * @brief  杩囨祦淇濇姢妫€鏌?
+ * @note   瀵瑰簲鍘熶唬鐮?
+ *           if(Batteryval[17]>5000) { Close_DSG_CHG(); OC_FLAG=1; }
+ *           if(OC_FLAG==1) { if(<5000) { Open_DSG_CHG(); OC_FLAG=0; } }
+ *
+ *         娉ㄦ剰: 鍘熶唬鐮佺敤缁濆鍊煎垽鏂? current_mA鍙兘涓鸿礋(鍏呯數)
+ *         杩欓噷鍙栫粷瀵瑰€兼瘮杈? 鍏呮斁鐢甸兘淇濇姢
+ */
+static void BQ_CheckOC(void)
+{
+    int abs_current = bms_data.current_mA;
+    if (abs_current < 0)
+        abs_current = -abs_current;
+
+    if (!g_prot.oc_flag)
+    {
+        if (abs_current > BQ_OC_THRESHOLD)
+        {
+            BQ76940_CloseAll();
+             BQ76940_ClearBalance();   /* 淇濇姢瑙﹀彂鏃跺仠姝㈠潎琛?*/
+            BQ_WriteReg(REG_SYS_STAT, 0xFF);
+            g_prot.oc_flag = 1;
+        }
+    }
+
+    if (g_prot.oc_flag)
+    {
+        if (abs_current < BQ_OC_RECOVER)
+        {
+            BQ76940_OpenAll();
+            BQ_WriteReg(REG_SYS_STAT, 0xFF);
+            g_prot.oc_flag = 0;
+        }
+    }
+}
+
+/**
+ * @brief  杩囨俯淇濇姢妫€鏌?
+ * @note   瀵瑰簲鍘熶唬鐮?
+ *           if(Batteryval[18]>Read_Flash(Temp_up)) { Close_DSG_CHG(); Temp_up_flag=1; }
+ *           if(Temp_up_flag==1) { if(<闃堝€? { Open_DSG_CHG(); Temp_up_flag=0; } }
+ *
+ *         鏀硅繘: 瑙﹀彂闃堝€?60掳C)鍜屾仮澶嶉槇鍊?55掳C)涓嶅悓, 鍔犲叆5掳C鍥炲樊
+ *         闃叉娓╁害鍦ㄩ槇鍊奸檮杩戞姈鍔ㄥ鑷碝OS鍙嶅寮€鍏?
+ */
+static void BQ_CheckOT(void)
+{
+    if (!g_prot.ot_flag)
+    {
+        if (bms_data.temp_degC > (float)BQ_OT_THRESHOLD)
+        {
+            BQ76940_CloseAll();
+             BQ76940_ClearBalance();   /* 淇濇姢瑙﹀彂鏃跺仠姝㈠潎琛?*/
+            BQ_WriteReg(REG_SYS_STAT, 0xFF);
+            g_prot.ot_flag = 1;
+        }
+    }
+
+    if (g_prot.ot_flag)
+    {
+        if (bms_data.temp_degC < (float)BQ_OT_RECOVER)
+        {
+            BQ76940_OpenAll();
+            BQ_WriteReg(REG_SYS_STAT, 0xFF);
+            g_prot.ot_flag = 0;
+        }
+    }
+}
+
+/**
+ * @brief  鎵ц鍏ㄩ儴淇濇姢妫€鏌?
+ * @note   鍦ㄤ富寰幆 BQ76940_UpdateAll() 涔嬪悗璋冪敤
+ *         渚濇妫€鏌? 杩囧帇 -> 娆犲帇 -> 杩囨祦 -> 杩囨俯
+ */
+void BQ76940_ProtectionCheck(void)
+{
+    BQ_CheckOV();
+    BQ_CheckUV();
+    BQ_CheckOC();
+    BQ_CheckOT();
+}
+
+/**
+ * @brief  璇诲彇BQ76940纭欢鎶ヨ鏍囧織
+ * @note   瀵瑰簲鍘熶唬鐮?ALERT_1_Recognition()
+ *         璇籗YS_STAT瀵勫瓨鍣?
+ *           bit[3]=UV  bit[2]=OV  bit[1]=SCD  bit[0]=OCD
+ */
+void BQ76940_ReadAlerts(void)
+{
+    uint8_t sys_stat = BQ_ReadReg(REG_SYS_STAT);
+
+    g_prot.hw_uv = (sys_stat & 0x08) ? 1 : 0;
+    g_prot.hw_ov = (sys_stat & 0x04) ? 1 : 0;
+    g_prot.hw_scd = (sys_stat & 0x02) ? 1 : 0;
+    g_prot.hw_ocd = (sys_stat & 0x01) ? 1 : 0;
+}
+
+void BQ76940_ProtectionGet(BQ76940_Protection_t *prot)
+{
+    if (prot == NULL)
+        return;
+    *prot = g_prot;
+}
+
+void BQ76940_ProtectionReset(void)
+{
+    memset(&g_prot, 0, sizeof(g_prot));
+    BQ_WriteReg(REG_SYS_STAT, 0xFF); /* 鍚屾椂娓呯‖浠舵爣蹇?*/
+}
+
+/**
+ * @brief  CRC8鏍￠獙璁＄畻
+ * @note   瀹屽叏澶嶅埗鑷師浠ｇ爜 CRC8(), 澶氶」寮弅ey=7
+ *         BQ769x0鍐欐搷浣滃繀椤婚檮甯︽CRC
+ * @param  ptr: 鏁版嵁鎸囬拡
+ * @param  len: 鏁版嵁闀垮害
+ * @param  key: CRC澶氶」寮? 鍥哄畾涓?
+ * @retval CRC8鍊?
+ */
+static uint8_t CRC8(uint8_t *ptr, uint8_t len, uint8_t key)
+{
+    uint8_t i;
+    uint8_t crc = 0;
+
+    while (len-- != 0)
+    {
+        for (i = 0x80; i != 0; i /= 2)
+        {
+            if ((crc & 0x80) != 0)
+            {
+                crc *= 2;
+                crc ^= key;
+            }
+            else
+            {
+                crc *= 2;
+            }
+            if ((*ptr & i) != 0)
+            {
+                crc ^= key;
+            }
+        }
+        ptr++;
+    }
+    return crc;
+}
+
+/**
+ * @brief  鍐橞Q76940瀵勫瓨鍣?(甯RC8)
+ * @note   瀵瑰簲鍘熶唬鐮?IIC1_write_one_byte_CRC()
+ *         鍙戦€佸簭鍒? START->0x10->reg->data->CRC->STOP
+ *         CRC瑕嗙洊 [0x10, reg, data] 涓変釜瀛楄妭
+ * @param  reg:  瀵勫瓨鍣ㄥ湴鍧€
+ * @param  data: 瑕佸啓鍏ョ殑鏁版嵁
+ */
+static void BQ_WriteReg(uint8_t reg, uint8_t data)
+{
+    uint8_t crc_buf[3];
+    uint8_t crc;
+
+    crc_buf[0] = BQ76940_WRITE_ADDR;
+    crc_buf[1] = reg;
+    crc_buf[2] = data;
+    crc = CRC8(crc_buf, 3, 7);
+
+    if (!SW_I2C_Start())
+    {
+        BQ76940_CommRecord(0);
+        return;
+    }
+
+    SW_I2C_SendByte(BQ76940_WRITE_ADDR);
+    if (!SW_I2C_WaitAck())
+        goto i2c_fail;
+
+    SW_I2C_SendByte(reg);
+    if (!SW_I2C_WaitAck())
+        goto i2c_fail;
+
+    SW_I2C_SendByte(data);
+    if (!SW_I2C_WaitAck())
+        goto i2c_fail;
+
+    SW_I2C_SendByte(crc);
+    if (!SW_I2C_WaitAck())
+        goto i2c_fail;
+
+    SW_I2C_Stop();
+    BQ76940_CommRecord(1);
+    BQ_Delay(10);
+    return;
+
+i2c_fail:
+    SW_I2C_Stop();
+    BQ76940_CommRecord(0);
+}
+
+/**
+ * @brief  璇籅Q76940瀵勫瓨鍣?(鏃燙RC)
+ * @note   瀵瑰簲鍘熶唬鐮?IIC1_read_one_byte()
+ *         搴忓垪: START->0x10->reg->RESTART->0x11->璇?瀛楄妭->STOP
+ * @param  reg: 瀵勫瓨鍣ㄥ湴鍧€
+ * @retval 璇诲埌鐨勬暟鎹?
+ */
+static uint8_t BQ_ReadReg(uint8_t reg)
+{
+    uint8_t val = 0;
+
+    if (!SW_I2C_Start())
+    {
+        BQ76940_CommRecord(0);
+        return 0;
+    }
+
+    SW_I2C_SendByte(BQ76940_WRITE_ADDR);
+    if (!SW_I2C_WaitAck())
+        goto i2c_fail;
+
+    SW_I2C_SendByte(reg);
+    if (!SW_I2C_WaitAck())
+        goto i2c_fail;
+
+    if (!SW_I2C_Start())
+        goto i2c_fail;
+
+    SW_I2C_SendByte(BQ76940_READ_ADDR);
+    if (!SW_I2C_WaitAck())
+        goto i2c_fail;
+
+    val = SW_I2C_ReceiveByte();
+    SW_I2C_NAck();
+    SW_I2C_Stop();
+    BQ76940_CommRecord(1);
+    return val;
+
+i2c_fail:
+    SW_I2C_Stop();
+    BQ76940_CommRecord(0);
+    return 0;
+}
+
+/**
+ * @brief  璇籄DC鏍″噯鍙傛暟 (GAIN鍜孫FFSET)
+ * @note   瀵瑰簲鍘熶唬鐮?Get_offset()
+ *         GAIN = 365 + ((GAIN1[3:2]<<1) | (GAIN2[7:5]>>5))
+ *         OFFSET = 鏈夌鍙?bit (mV)
+ */
+static void BQ_ReadCalibration(void)
+{
+    uint8_t gain1, gain2, offset;
+
+    gain1 = BQ_ReadReg(REG_ADCGAIN1);   /* 0x50 */
+    gain2 = BQ_ReadReg(REG_ADCGAIN2);   /* 0x59 */
+    offset = BQ_ReadReg(REG_ADCOFFSET); /* 0x51 */
+
+    int adc_gain_bits = ((gain1 & 0x0C) << 1) + ((gain2 & 0xE0) >> 5);
+
+    bms_data.adc_gain = 365 + adc_gain_bits;
+    bms_data.adc_offset = (int8_t)offset;
+}
+
+/**
+ * @brief  鍒濆鍖朆Q76940
+ * @note   瀵瑰簲鍘熶唬鐮?BQ76930_config() 瀹屾暣娴佺▼:
+ *         1. WAKE_ALL_DEVICE()   -> PA8鑴夊啿鍞ら啋
+ *         2. BQ_1_config()       -> 12涓瘎瀛樺櫒鍐欏叆
+ *         3. Get_offset()        -> 璇籄DC鏍″噯
+ *         4. OV_UV_1_PROTECT()   -> 璁綩V/UV闃堝€?
+ *         5. OCD_SCD_PROTECT()   -> 璁句繚鎶?
+ *         6. 娓匰YS_STAT
+ */
+void BQ76940_Init(void)
+{
+    BQ76940_CommHealthReset(); /* 鏂板: 鍒濆鍖栨椂娓呴浂閫氫俊缁熻 */
+    /* 绗?姝? 鍞ら啋BQ76940
+     * 瀵瑰簲鍘熶唬鐮?WAKE_ALL_DEVICE():
+     *   MCU_WAKE_BQ_ONOFF(1); delay_ms(100); MCU_WAKE_BQ_ONOFF(0);
+     * BQ76940涓婄數鍚庡湪SHIP妯″紡, PA8鑴夊啿鍞ら啋鍒癗ORMAL妯″紡 */
+    HAL_GPIO_WritePin(BQ_WAKE_PORT, BQ_WAKE_PIN, GPIO_PIN_SET);
+    BQ_Delay(100);
+    HAL_GPIO_WritePin(BQ_WAKE_PORT, BQ_WAKE_PIN, GPIO_PIN_RESET);
+    BQ_Delay(200);
+
+    /* 绗?姝? 瀵勫瓨鍣ㄥ垵濮嬪寲
+     * 瀵瑰簲鍘熶唬鐮?BQ_1_config() 寰幆鍐欏叆:
+     *   [0] SYS_STAT  =0xFF  娓呴櫎鎵€鏈夋爣蹇?
+     *   [1] CELLBAL1  =0x00  鍏冲潎琛?~5
+     *   [2] CELLBAL2  =0x00  鍏冲潎琛?~10
+     *   [3] CELLBAL3  =0x00  鍏冲潎琛?1~15
+     *   [4] SYS_CTRL1 =0x18  ADC_EN=1, TEMP_SEL=1
+     *   [5] SYS_CTRL2 =0x43  CC_EN=1, DSG_ON=1, CHG_ON=1
+     *   [6] PROTECT1  =0x00
+     *   [7] PROTECT2  =0x00
+     *   [8] PROTECT3  =0x00
+     *   [9] OV_TRIP   =0x00
+     *  [10] UV_TRIP   =0x00
+     *  [11] CC_CFG    =0x19  搴撲粦璁￠厤缃?*/
+    uint8_t init_reg[] = {0x00, 0x01, 0x02, 0x03, 0x04, 0x05,
+                          0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B};
+    uint8_t init_data[] = {0xFF, 0x00, 0x00, 0x00, 0x18, 0x43,
+                           0x00, 0x00, 0x00, 0x00, 0x00, 0x19};
+
+    for (int i = 0; i < 12; i++)
+    {
+        BQ_Delay(10);
+        BQ_WriteReg(init_reg[i], init_data[i]);
+    }
+
+    /* 绗?姝? 璇籄DC鏍″噯, 瀵瑰簲鍘熶唬鐮?Get_offset() */
+    BQ_ReadCalibration();
+
+    /* 绗?姝? 璁捐繃鍘?娆犲帇闃堝€?
+     * 瀵瑰簲鍘熶唬鐮?OV_UV_1_PROTECT():
+     *   OVPThreshold=4400mV, UVPThreshold=2400mV
+     *   t=0.377 (GAIN/1000杩戜技鍊?
+     *   Trip = ((Threshold - offset) / t + 0.5) >> 4 */
+    float t = 0.377f;
+    uint8_t ov_trip = (uint8_t)((((uint16_t)((4400 - bms_data.adc_offset) / t + 0.5f)) >> 4) & 0xFF);
+    uint8_t uv_trip = (uint8_t)((((uint16_t)((2400 - bms_data.adc_offset) / t + 0.5f)) >> 4) & 0xFF);
+    BQ_WriteReg(REG_OV_TRIP, ov_trip);
+    BQ_WriteReg(REG_UV_TRIP, uv_trip);
+
+    /* 绗?姝? SCD/OCD淇濇姢
+     * 瀵瑰簲鍘熶唬鐮?OCD_SCD_PROTECT():
+     *   PROTECT1=0xFF  SCD寤舵椂400us, 闃堝€?00mV
+     *   PROTECT2=0xFF  OCD寤舵椂1280ms, 闃堝€?00mV */
+    BQ_WriteReg(REG_PROTECT1, 0xFF);
+    BQ_WriteReg(REG_PROTECT2, 0xFF);
+
+    /* 绗?姝? 娓呯姸鎬佸瘎瀛樺櫒 */
+    BQ_WriteReg(REG_SYS_STAT, 0xFF);
+
+    /* 鍒濆鍖栬繃婊ょ浉鍏崇姸鎬? 閬垮厤涓婄數闅忔満鍊?*/
+    for (int i = 0; i < CELL_COUNT; i++)
+    {
+        bms_data.cell_raw_mv[i] = 0;
+        bms_data.cell_valid[i] = 1;
+        bms_data.cell_invalid_cnt[i] = 0;
+        bms_data.cell_mv[i] = 3600; /* 缁欎竴涓畨鍏ㄤ腑闂村€? 绛夊緟棣栨鏈夋晥閲囨牱瑕嗙洊 */
+    }
+    /* 鍒濆鍖栨俯搴﹁繃婊ょ姸鎬?*/
+    bms_data.temp_raw_degC = 0.0f;
+    bms_data.temp_valid = 1;
+    bms_data.temp_invalid_cnt = 0;
+    bms_data.temp_degC = 25.0f; /* 涓婄數榛樿25掳C, 闃叉棣栬疆璇Е鍙?*/
+
+    /* 鍒濆鍖栫數鑺护娉㈢獥鍙?*/
+    for (int i = 0; i < CELL_COUNT; i++)
+    {
+        BQ_CellFilterReset((uint8_t)i, bms_data.cell_mv[i]);
+    }
+
+    /* 鍒濆鍖栨俯搴︽护娉㈢獥鍙?*/
+    BQ_TempFilterReset(bms_data.temp_degC);
+
+    bms_data.soc_percent = 0;
+
+     /* 鍧囪　鍒濆鍖? 鍏抽棴鎵€鏈夊潎琛￠€氶亾 (瀵瑰簲鍘烞SP BQ_1_config涓?CELLBAL1/2/3=0x00) */
+    BQ76940_ClearBalance();
+}
+
+/**
+ * @brief  鍒ゆ柇鍗曚綋鐢靛帇鏄惁鍦ㄦ湁鏁堣寖鍥村唴
+ * @param  mv: 寰呭垽鏂殑鐢靛帇鍊?mV)
+ * @retval 1=鏈夋晥, 0=瓒婄晫鏃犳晥
+ * @note   绗?灏忔浠呭仛"瓒婄晫杩囨护"
+ *         鍚庣画绗?/绗?灏忔浼氬姞娓╁害杩囨护鍜屾粦鍔ㄥ钩鍧?
+ */
+static uint8_t BQ_IsCellVoltageValid(int mv)
+{
+    if (mv < BQ_CELL_VALID_MIN_MV)
+    {
+        return 0;
+    }
+    if (mv > BQ_CELL_VALID_MAX_MV)
+    {
+        return 0;
+    }
+    return 1;
+}
+
+/**
+ * @brief  鍙杋nt缁濆鍊?
+ */
+static int BQ_AbsInt(int v)
+{
+    return (v < 0) ? (-v) : v;
+}
+
+/**
+ * @brief  鍙杅loat缁濆鍊?
+ */
+static float BQ_AbsFloat(float v)
+{
+    return (v < 0.0f) ? (-v) : v;
+}
+
+/**
+ * @brief  閲嶇疆鏌愯妭鐢佃姱婊ゆ尝绐楀彛
+ * @param  idx: 鐢佃姱绱㈠紩
+ * @param  seed_mv: 鍒濆濉厖鍊?
+ */
+static void BQ_CellFilterReset(uint8_t idx, int seed_mv)
+{
+    g_cell_hist_cnt[idx] = BQ_FILTER_WINDOW_SIZE;
+    g_cell_hist_widx[idx] = 0;
+
+    for (int k = 0; k < BQ_FILTER_WINDOW_SIZE; k++)
+    {
+        g_cell_hist[idx][k] = seed_mv;
+    }
+}
+
+/**
+ * @brief  鐢佃姱鐢靛帇婊戝姩骞冲潎 + 鍘绘姈
+ * @param  idx: 鐢佃姱绱㈠紩
+ * @param  sample_mv: 鏈疆鏈夋晥閲囨牱鍊?mV)
+ * @retval 杩囨护鍚庣殑杈撳嚭鍊?mV)
+ * @note   澶勭悊娴佺▼:
+ *         1) 鍐欏叆婊戝姩绐楀彛
+ *         2) 璁＄畻绐楀彛骞冲潎
+ *         3) 涓庡綋鍓嶈緭鍑烘瘮杈? 鑻ュ彉鍖?=姝诲尯鍒欎繚鎸佸師鍊?
+ */
+static int BQ_CellFilterUpdate(uint8_t idx, int sample_mv)
+{
+    int sum = 0;
+    int avg;
+
+    /* 1) 鍐欏叆鐜舰缂撳啿 */
+    g_cell_hist[idx][g_cell_hist_widx[idx]] = sample_mv;
+    g_cell_hist_widx[idx]++;
+    if (g_cell_hist_widx[idx] >= BQ_FILTER_WINDOW_SIZE)
+    {
+        g_cell_hist_widx[idx] = 0;
+    }
+
+    if (g_cell_hist_cnt[idx] < BQ_FILTER_WINDOW_SIZE)
+    {
+        g_cell_hist_cnt[idx]++;
+    }
+
+    /* 2) 璁＄畻骞冲潎鍊?*/
+    for (int k = 0; k < g_cell_hist_cnt[idx]; k++)
+    {
+        sum += g_cell_hist[idx][k];
+    }
+    avg = sum / g_cell_hist_cnt[idx];
+
+    /* 3) 鍘绘姈: 灏忓彉鍖栦笉鏇存柊 */
+    if (BQ_AbsInt(avg - bms_data.cell_mv[idx]) <= BQ_CELL_DEBOUNCE_MV)
+    {
+        return bms_data.cell_mv[idx];
+    }
+
+    return avg;
+}
+
+/**
+ * @brief  閲嶇疆娓╁害婊ゆ尝绐楀彛
+ * @param  seed_temp: 鍒濆娓╁害鍊?
+ */
+static void BQ_TempFilterReset(float seed_temp)
+{
+    g_temp_hist_cnt = BQ_FILTER_WINDOW_SIZE;
+    g_temp_hist_widx = 0;
+
+    for (int k = 0; k < BQ_FILTER_WINDOW_SIZE; k++)
+    {
+        g_temp_hist[k] = seed_temp;
+    }
+}
+
+/**
+ * @brief  娓╁害婊戝姩骞冲潎 + 鍘绘姈
+ * @param  sample_temp: 鏈疆鏈夋晥娓╁害鍊?掳C)
+ * @retval 杩囨护鍚庣殑娓╁害鍊?掳C)
+ */
+static float BQ_TempFilterUpdate(float sample_temp)
+{
+    float sum = 0.0f;
+    float avg;
+
+    /* 1) 鍐欏叆鐜舰缂撳啿 */
+    g_temp_hist[g_temp_hist_widx] = sample_temp;
+    g_temp_hist_widx++;
+    if (g_temp_hist_widx >= BQ_FILTER_WINDOW_SIZE)
+    {
+        g_temp_hist_widx = 0;
+    }
+
+    if (g_temp_hist_cnt < BQ_FILTER_WINDOW_SIZE)
+    {
+        g_temp_hist_cnt++;
+    }
+
+    /* 2) 璁＄畻骞冲潎鍊?*/
+    for (int k = 0; k < g_temp_hist_cnt; k++)
+    {
+        sum += g_temp_hist[k];
+    }
+    avg = sum / (float)g_temp_hist_cnt;
+
+    /* 3) 鍘绘姈 */
+    if (BQ_AbsFloat(avg - bms_data.temp_degC) <= BQ_TEMP_DEBOUNCE_C)
+    {
+        return bms_data.temp_degC;
+    }
+
+    return avg;
+}
+
+/**
+ * @brief  搴旂敤鍗曚綋鐢靛帇杩囨护
+ * @param  idx: 鐢佃姱绱㈠紩(0~CELL_COUNT-1)
+ * @param  sample_mv: 鏈疆鍘熷閲囨牱鍊?mV)
+ * @note   杩囨护绛栫暐:
+ *         1) 鏈夋晥鍊? 瑕嗙洊 cell_mv[idx], 骞舵爣璁皏alid=1
+ *         2) 鏃犳晥鍊? 涓嶈鐩?cell_mv[idx] (淇濈暀涓婃鏈夋晥鍊?, 鏍囪valid=0
+ *         3) 鑻ョ涓€娆′笂鐢靛皻鏃犳湁鏁堝巻鍙插€?榛樿0), 涓旀湰杞棤鏁?
+ *            鍒欑粰涓€涓畨鍏ㄥ崰浣嶅€?600mV, 闃叉淇濇姢閫昏緫琚?mV璇Е鍙?
+ */
+static uint8_t s_jump_cnt[CELL_COUNT] = {0};  /* 璺冲彉杩炵画璁℃暟 */
+
+static void BQ_FilterAndUpdateCell(uint8_t idx, int sample_mv)
+{
+    bms_data.cell_raw_mv[idx] = sample_mv; /* 鍏堣褰曞師濮嬪€? 渚夸簬璋冭瘯 */
+
+    if (BQ_IsCellVoltageValid(sample_mv))
+    {
+        /* 璺冲彉闄愬箙: 宸叉湁鏈夋晥鍘嗗彶鍊?闈炲垵濮?600鍗犱綅)鏃?
+         * 鍗曟鍋忓樊>30mV璁′负1娆¤烦鍙? 杩炵画<3娆″垯涓㈠純.
+         * 杩炵画>=3娆¤鏄庢槸鐪熷疄鍙樺寲, 鎺ュ彈骞堕噸缃护娉㈢獥鍙?*/
+        if (bms_data.cell_valid[idx] && bms_data.cell_mv[idx] > 0
+            && bms_data.cell_mv[idx] != 3600)
+        {
+            int delta = BQ_AbsInt(sample_mv - bms_data.cell_mv[idx]);
+            if (delta > 30)
+            {
+                s_jump_cnt[idx]++;
+                if (s_jump_cnt[idx] < 3)
+                {
+                    /* 璺冲彉娆℃暟涓嶅, 涓㈠純 */
+                    return;
+                }
+                /* 杩炵画3娆¤烦鍙? 璁や负鏄湡瀹炲彉鍖? 閲嶇疆婊ゆ尝绐楀彛 */
+                BQ_CellFilterReset(idx, sample_mv);
+                s_jump_cnt[idx] = 0;
+            }
+            else
+            {
+                s_jump_cnt[idx] = 0;  /* 姝ｅ父閲囨牱, 娓呴浂璁℃暟 */
+            }
+        }
+
+        /* 鏈夋晥閲囨牱: 鍏堝仛婊戝姩骞冲潎鍜屽幓鎶? 鍐嶆洿鏂版渶缁堣緭鍑?*/
+        int filtered_mv = BQ_CellFilterUpdate(idx, sample_mv);
+        bms_data.cell_mv[idx] = filtered_mv;
+        bms_data.cell_valid[idx] = 1;
+        return;
+    }
+
+    /* 瓒婄晫鏃犳晥: 璁℃暟+缃棤鏁堟爣蹇?*/
+    bms_data.cell_valid[idx] = 0;
+    if (bms_data.cell_invalid_cnt[idx] < 0xFFFFU)
+    {
+        bms_data.cell_invalid_cnt[idx]++;
+    }
+
+    /* 棣栬疆鏃犲巻鍙叉湁鏁堝€兼椂, 缁欎竴涓腑闂村崰浣嶅€奸伩鍏嶈淇濇姢 */
+    if (bms_data.cell_mv[idx] == 0)
+    {
+        bms_data.cell_mv[idx] = 3600;
+    }
+}
+
+/**
+ * @brief  璇诲彇15鑺傜數姹犵數鍘嬪苟璁＄畻鎬荤數鍘?
+ * @note   瀵瑰簲鍘熶唬鐮?Get_Battery1()~Get_Battery15() + Get_Update_ALL_Data()
+ *         瀵勫瓨鍣ㄥ湴鍧€ (浠庡師浠ｇ爜閫愬嚱鏁版彁鍙栭獙璇?:
+ *           Cell1=0x0C  Cell2=0x0E  Cell3=0x10
+ *           Cell4=0x12  Cell5=0x14  Cell6=0x16
+ *           Cell7=0x18  Cell8=0x1A  Cell9=0x1C
+ *           Cell10=0x1E Cell11=0x20 Cell12=0x22
+ *           Cell13=0x24 Cell14=0x26 Cell15=0x28
+ *         鍏紡: HI鍦板潃 = 0x0C + (n-1)*2
+ *         鐢靛帇: mV = (raw * adc_gain) / 1000 + adc_offset
+ */
+void BQ76940_ReadAllCells(void)
+{
+    uint8_t hi, lo;
+    int gain = bms_data.adc_gain;
+    int offset = bms_data.adc_offset;
+    int pack_sum = 0;
+
+    /* 璇荤數鍘嬪墠鏆傚仠鍧囪　, 閬垮厤鍧囪　鐢垫祦瀵艰嚧閲囨牱鍋忎綆 */
+    uint16_t saved_bal = bms_data.balance_mask;
+    if (saved_bal) {
+        BQ76940_ClearBalance();
+        BQ_Delay(5);  /* 绛夊潎琛ET鍏虫柇, ADC绋冲畾 */
+    }
+
+    for (int i = 0; i < CELL_COUNT; i++)
+    {
+        uint8_t reg_hi = REG_VC1_HI + i * 2;
+        uint8_t reg_lo = reg_hi + 1;
+
+        /* 涓庡師浠ｇ爜涓€鑷? 鍏堣HI鍐嶈LO */
+        hi = BQ_ReadReg(reg_hi);
+        lo = BQ_ReadReg(reg_lo);
+
+        /* 鍘熷璁＄畻鍊? mV = (raw * gain)/1000 + offset */
+        int16_t raw = ((int16_t)hi << 8) | lo;
+        int sample_mv = (raw * gain) / 1000 + offset;
+
+        /* 绗?灏忔: 瀵瑰崟浣撶數鍘嬪仛瓒婄晫杩囨护 */
+        BQ_FilterAndUpdateCell((uint8_t)i, sample_mv);
+
+        /* 娉ㄦ剰:
+         * pack_sum浣跨敤"杩囨护鍚庣殑cell_mv"杩涜绱姞,
+         * 鍙伩鍏嶆煇涓€鑺傜灛鏃跺紓甯告妸鎬诲帇鎷夐 */
+        pack_sum += bms_data.cell_mv[i];
+    }
+
+    /* 鎬荤數鍘?杩囨护鍚庡悇鑺備箣鍜?*/
+    bms_data.pack_mv = pack_sum;
+
+    /* 璇诲畬鎭㈠鍧囪　 */
+    if (saved_bal) {
+        BQ76940_SetBalance(saved_bal);
+    }
+}
+
+/**
+ * @brief  鍒ゆ柇娓╁害鍊兼槸鍚﹀湪鏈夋晥鑼冨洿鍐?
+ * @param  temp: 寰呭垽鏂殑娓╁害鍊?掳C)
+ * @retval 1=鏈夋晥, 0=瓒婄晫鏃犳晥
+ * @note   BQ_TEMP_VALID_MIN_C / BQ_TEMP_VALID_MAX_C 鍧囦负鍙皟瀹?
+ *         NTC鏂嚎鏃秚emp鎺ヨ繎0掳C鎴栬礋鍊? 鐭矾鏃舵帴杩戞瀬澶? 鍧囧湪鑼冨洿澶?
+ */
+static uint8_t BQ_IsTempValid(float temp)
+{
+    if (temp < (float)BQ_TEMP_VALID_MIN_C)
+    {
+        return 0;
+    }
+    if (temp > (float)BQ_TEMP_VALID_MAX_C)
+    {
+        return 0;
+    }
+    return 1;
+}
+
+/**
+ * @brief  璇诲彇娓╁害 (TS1閫氶亾, NTC 10K/B3380)
+ * @note   瀵瑰簲鍘熶唬鐮?Get_BQ1_2_Temp()
+ *         鍘熶唬鐮佽绠楁楠?
+ *           1. raw = (HI<<8)|LO
+ *           2. vtsx = raw*382/1000           (ADC杞數鍘媘V)
+ *           3. Rt = 10000*vtsx/(3300-vtsx)   (鍒嗗帇绠桸TC闃诲€?
+ *           4. T = 1/(1/T2+ln(Rt/Rp)/B)-273.15  (B鍊兼硶绠楁俯搴?
+ *         鍙傛暟: T2=298.15K, Rp=10000, B=3380
+ */
+void BQ76940_ReadTemp(void)
+{
+    uint8_t hi, lo;
+
+    hi = BQ_ReadReg(REG_TS1_HI); /* 0x2C */
+    lo = BQ_ReadReg(REG_TS1_LO); /* 0x2D */
+
+    int raw = ((int)hi << 8) | lo;
+
+    /* ADC杞數鍘?(瀵瑰簲鍘熶唬鐮? vtsx = raw * 382 / 1000) */
+    int vtsx_mv = raw * 382 / 1000;
+    if (vtsx_mv >= 3300)
+    {
+        vtsx_mv = 3299; /* 闃查櫎闆? NTC鐭矾鏃禫tsx鎺ヨ繎3300, 鎴柇澶勭悊 */
+    }
+
+    /* 鍒嗗帇鍏紡绠桸TC闃诲€?*/
+    float Rt = 10000.0f * vtsx_mv / (3300 - vtsx_mv);
+
+    /* B鍊兼硶璁＄畻娓╁害 (瀵瑰簲鍘熶唬鐮佸弬鏁? T2=25掳C+273.15, B=3380, Rp=10K) */
+    float T2 = 273.15f + 25.0f;
+    float Bx = 3380.0f;
+    float Rp = 10000.0f;
+    float Ka = 273.15f;
+
+    float sample_temp;
+    if (Rt > 0.0f)
+    {
+        sample_temp = 1.0f / (1.0f / T2 + logf(Rt / Rp) / Bx) - Ka + 0.5f;
+    }
+    else
+    {
+        sample_temp = -999.0f; /* NTC闃诲€煎紓甯? 鍏堢粰鏃犳晥鍗犱綅鍊?*/
+    }
+
+    /* 璁板綍鍘熷鍊间緵璋冭瘯瑙傚療 */
+    bms_data.temp_raw_degC = sample_temp;
+
+    /* 绗?灏忔: 瓒婄晫杩囨护 */
+    if (BQ_IsTempValid(sample_temp))
+    {
+        /* 鏈夋晥閲囨牱: 鍏堟粦鍔ㄥ钩鍧?鍘绘姈, 鍐嶆洿鏂拌緭鍑?*/
+        float filtered_temp = BQ_TempFilterUpdate(sample_temp);
+        bms_data.temp_degC = filtered_temp;
+        bms_data.temp_valid = 1;
+    }
+    else
+    {
+        bms_data.temp_valid = 0; /* 鏃犳晥, 涓嶈鐩栦笂涓€杞湁鏁堝€?*/
+        if (bms_data.temp_invalid_cnt < 0xFFFFU)
+        {
+            bms_data.temp_invalid_cnt++;
+        }
+        /* 涓婄數棣栬疆鏃犲巻鍙叉湁鏁堝€兼椂缁欏畨鍏ㄥ崰浣嶅€?*/
+        if (bms_data.temp_degC == 0.0f)
+        {
+            bms_data.temp_degC = 25.0f; /* 25掳C涓棿鍊? 淇濊瘉涓嶈瑙﹀彂OT淇濇姢 */
+        }
+    }
+}
+
+/**
+ * @brief  璇诲彇鐢垫祦 (搴撲粦璁?
+ * @note   瀵瑰簲鍘熶唬鐮?Get_BQ_Current()
+ *         raw<=0x7D00: 鏀剧數, I = raw * 2.11 mA
+ *         raw> 0x7D00: 鍏呯數, I = -(0xFFFF-raw) * 2.11 mA
+ *         2.11 = 8.44uV/LSB / 4mR閲囨牱鐢甸樆
+ *         濡傛灉閲囨牱鐢甸樆涓嶆槸4mR, 鏀圭郴鏁? 8.44/Rsense(mR)
+ *
+ *         浼樺寲: 1) 妫€鏌C_READY纭繚璇诲埌鏂拌浆鎹㈢粨鏋?
+ *               2) 4鐐圭Щ鍔ㄥ钩鍧囨护娉?
+ *               3) 卤3mA姝诲尯娑堥櫎闆舵紓
+ */
+#define CURR_FILTER_LEN  4
+static int s_curr_buf[CURR_FILTER_LEN] = {0};
+static uint8_t s_curr_idx = 0;
+static uint8_t s_curr_filled = 0;
+
+void BQ76940_ReadCurrent(void)
+{
+    uint8_t hi, lo;
+
+    /* 妫€鏌C_READY浣?SYS_STAT bit7), 鏈氨缁垯璺宠繃鏈(淇濈暀涓婃鍊? */
+    uint8_t sys_stat = BQ_ReadReg(REG_SYS_STAT);
+    if (!(sys_stat & 0x80))
+    {
+        return;  /* CC杞崲鏈畬鎴? 淇濈暀涓婃鍊?*/
+    }
+    /* 娓匔C_READY鏍囧織 */
+    BQ_WriteReg(REG_SYS_STAT, 0x80);
+
+    hi = BQ_ReadReg(REG_CC_HI); /* 0x32 */
+    lo = BQ_ReadReg(REG_CC_LO); /* 0x33 */
+
+    uint16_t raw = ((uint16_t)hi << 8) | lo;
+    int sample;
+
+    if (raw <= 0x7D00)
+    {
+        sample = (int)(raw * 2.11f);
+    }
+    else
+    {
+        sample = -(int)((0xFFFF - raw) * 2.11f);
+    }
+
+    /* 绉诲姩骞冲潎婊ゆ尝 */
+    s_curr_buf[s_curr_idx] = sample;
+    s_curr_idx = (s_curr_idx + 1) % CURR_FILTER_LEN;
+    if (!s_curr_filled && s_curr_idx == 0)
+        s_curr_filled = 1;
+
+    int sum = 0;
+    int n = s_curr_filled ? CURR_FILTER_LEN : s_curr_idx;
+    if (n == 0) n = 1;
+    for (int i = 0; i < n; i++)
+        sum += s_curr_buf[i];
+    bms_data.current_mA = sum / n;
+
+    /* 卤3mA 姝诲尯: 娑堥櫎闆舵紓 */
+    if (bms_data.current_mA >= -3 && bms_data.current_mA <= 3)
+    {
+        bms_data.current_mA = 0;
+    }
+}
+
+/* ==================== SOC浼扮畻(鐢靛帇鏌ヨ〃娉? ====================
+ * 璇存槑:
+ *   - 15涓叉€诲帇闃堝€?= 鍗曚覆闃堝€?* 15
+ *   - 琛ㄩ」鎸夌數鍘嬩粠楂樺埌浣庢帓鍒? 鍛戒腑绗竴涓槇鍊煎嵆杩斿洖瀵瑰簲SOC
+ *
+ * 娉ㄦ剰:
+ *   璇ユ柟娉曚笌璐熻浇銆佺數鑺€佸寲銆佹俯搴︾浉鍏虫€ц緝澶?
+ *   浠呬綔涓虹涓€鐗堝彲鐢ㄦ柟妗堛€?
+ * ============================================================ */
+
+typedef struct
+{
+    int pack_mv_threshold; /* 鎬诲帇闃堝€?mV), 澶т簬绛変簬璇ュ€煎垯鍛戒腑 */
+    uint8_t soc;           /* 瀵瑰簲SOC(%) */
+} BQ_SocPoint_t;
+
+/*
+ * 鍏煎鍘烞SP鍖洪棿椋庢牸鐨勬槧灏勮〃(鍋氫簡杞诲井鏁寸悊):
+ *  4150*15 -> 100
+ *  4100*15 -> 95
+ *  4050*15 -> 90
+ *  4000*15 -> 88
+ *  3950*15 -> 87
+ *  3900*15 -> 86
+ *  3850*15 -> 84
+ *  3800*15 -> 83
+ *  3750*15 -> 82
+ *  3700*15 -> 81
+ *  3650*15 -> 80
+ *  3600*15 -> 79
+ *  3550*15 -> 78
+ *  3500*15 -> 77
+ *  3450*15 -> 40
+ *  3400*15 -> 30
+ *  3300*15 -> 20
+ *  3200*15 -> 10
+ *  3100*15 -> 5
+ */
+static const BQ_SocPoint_t g_soc_table[] = {
+    {4150 * CELL_COUNT, 100},
+    {4100 * CELL_COUNT, 95},
+    {4050 * CELL_COUNT, 90},
+    {4000 * CELL_COUNT, 88},
+    {3950 * CELL_COUNT, 87},
+    {3900 * CELL_COUNT, 86},
+    {3850 * CELL_COUNT, 84},
+    {3800 * CELL_COUNT, 83},
+    {3750 * CELL_COUNT, 82},
+    {3700 * CELL_COUNT, 81},
+    {3650 * CELL_COUNT, 80},
+    {3600 * CELL_COUNT, 79},
+    {3550 * CELL_COUNT, 78},
+    {3500 * CELL_COUNT, 77},
+    {3450 * CELL_COUNT, 40},
+    {3400 * CELL_COUNT, 30},
+    {3300 * CELL_COUNT, 20},
+    {3200 * CELL_COUNT, 10},
+    {3100 * CELL_COUNT, 5}};
+
+void BQ76940_UpdateSOC(void)
+{
+    int pack = bms_data.pack_mv;
+
+    /* 榛樿鏈€浣嶴OC=0, 濡傛灉鍛戒腑闃堝€间細琚鐩?*/
+    bms_data.soc_percent = 0;
+
+    for (uint32_t i = 0; i < (sizeof(g_soc_table) / sizeof(g_soc_table[0])); i++)
+    {
+        if (pack >= g_soc_table[i].pack_mv_threshold)
+        {
+            bms_data.soc_percent = g_soc_table[i].soc;
+            return;
+        }
+    }
+}
+
+/* ==================== 鍧囪　鎺у埗 ====================
+ * 鍘烞SP: Battery1_Balance() ... Battery10_Balance()
+ *        鍙啓浜?涓崟浣? 鍏ㄩ儴鏍囪涓篣NUSED(浠庢湭琚皟鐢?
+ * 鏈疄鐜? 瑕嗙洊鍏?5涓崟浣? 鏀寔bitmask澶氳矾鎺у埗
+ *
+ * CELLBAL瀵勫瓨鍣ㄥ湴鍧€:
+ *   REG_CELLBAL1 (0x01): bit[4:0] = 鍗曚綋 1~5
+ *   REG_CELLBAL2 (0x02): bit[4:0] = 鍗曚綋 6~10
+ *   REG_CELLBAL3 (0x03): bit[4:0] = 鍗曚綋 11~15
+ * =================================================== */
+
+void BQ76940_SetBalance(uint16_t cell_mask)
+{
+    uint8_t cb1, cb2, cb3;
+
+    /* 浠?16-bit mask 鎷嗗垎鍒颁笁涓瘎瀛樺櫒鐨勪綆5浣?*/
+    cb1 = (uint8_t)( cell_mask        & 0x1F);   /* bit[4:0] 鈫?鍗曚綋1~5   */
+    cb2 = (uint8_t)((cell_mask >> 5)  & 0x1F);   /* bit[9:5] 鈫?鍗曚綋6~10  */
+    cb3 = (uint8_t)((cell_mask >> 10) & 0x1F);   /* bit[14:10] 鈫?鍗曚綋11~15 */
+
+    BQ_WriteReg(REG_CELLBAL1, cb1);
+    BQ_WriteReg(REG_CELLBAL2, cb2);
+    BQ_WriteReg(REG_CELLBAL3, cb3);
+
+    /* 鍚屾鍒版暟鎹粨鏋?*/
+    bms_data.balance_mask = cell_mask & 0x7FFF;
+}
+
+void BQ76940_ClearBalance(void)
+{
+    BQ76940_SetBalance(0x0000);
+}
+
+uint16_t BQ76940_GetBalanceMask(void)
+{
+    uint8_t cb1, cb2, cb3;
+    uint16_t mask;
+
+    cb1 = BQ_ReadReg(REG_CELLBAL1) & 0x1F;
+    cb2 = BQ_ReadReg(REG_CELLBAL2) & 0x1F;
+    cb3 = BQ_ReadReg(REG_CELLBAL3) & 0x1F;
+
+    mask = (uint16_t)cb1
+         | ((uint16_t)cb2 << 5)
+         | ((uint16_t)cb3 << 10);
+
+    bms_data.balance_mask = mask;
+    return mask;
+}
+
+void BQ76940_UpdateAll(void)
+{
+    BQ76940_ReadAllCells();
+    BQ76940_ReadTemp();
+    BQ76940_ReadCurrent();
+
+    /* 璁＄畻宸茶繛鎺ョ數鑺钩鍧囩數鍘?(>1000mV鐨勮涓烘湁鏁? */
+    int sum = 0, cnt = 0;
+    for (int i = 0; i < CELL_COUNT; i++) {
+        if (bms_data.cell_mv[i] > 1000) {
+            sum += bms_data.cell_mv[i];
+            cnt++;
+        }
+    }
+    int avg_mv = (cnt > 0) ? (sum / cnt) : 3600;
+
+    /* 搴撲粦璁OC鏇存柊 (鏇夸唬鏃х殑鐢靛帇琛ㄦ硶) */
+    SOC_Update(bms_data.current_mA, bms_data.pack_mv, avg_mv,
+               bms_data.chg_on, SOC_SAMPLE_PERIOD_MS);
+    bms_data.soc_percent = SOC_GetState()->soc_percent;
+
+    BQ_ReadMosStatus();
+}
+
+void BQ76940_PrintData(UART_HandleTypeDef *huart)
+{
+    (void)huart;  /* 鏀圭敤UART_DMA_Send(), 涓嶅啀鐩存帴浣跨敤huart */
+    char buf[64];
+    int len;
+
+    len = snprintf(buf, sizeof(buf), "\r\n===== BMS Data =====\r\n");
+    UART_DMA_Send((uint8_t *)buf, len);
+
+    for (int i = 0; i < CELL_COUNT; i++)
+    {
+        len = snprintf(buf, sizeof(buf),
+                       "Cell%02d: %d mV (raw=%d, ok=%d, bad=%u)\r\n",
+                       i + 1,
+                       bms_data.cell_mv[i],
+                       bms_data.cell_raw_mv[i],
+                       bms_data.cell_valid[i],
+                       bms_data.cell_invalid_cnt[i]);
+        UART_DMA_Send((uint8_t *)buf, len);
+    }
+
+    len = snprintf(buf, sizeof(buf), "Pack:   %d mV\r\n", bms_data.pack_mv);
+    UART_DMA_Send((uint8_t *)buf, len);
+
+    len = snprintf(buf, sizeof(buf), "SOC:    %u %%\r\n", bms_data.soc_percent);
+    UART_DMA_Send((uint8_t *)buf, len);
+
+    {
+        SOC_State_t *ss = SOC_GetState();
+        len = snprintf(buf, sizeof(buf), "SOH:    %u %%\r\n", ss->soh_percent);
+        UART_DMA_Send((uint8_t *)buf, len);
+        len = snprintf(buf, sizeof(buf), "Cap:    %.0f/%.0f mAh\r\n",
+                       ss->soc_mAh, ss->full_cap_mAh);
+        UART_DMA_Send((uint8_t *)buf, len);
+        len = snprintf(buf, sizeof(buf), "Cycle:  %u.%u\r\n",
+                       ss->cycle_count_x10 / 10, ss->cycle_count_x10 % 10);
+        UART_DMA_Send((uint8_t *)buf, len);
+    }
+
+    /* 鎵撳嵃鍧囪　鐘舵€? 鏄剧ず鍝簺鍗曚綋姝ｅ湪鍧囪　 */
+    len = snprintf(buf, sizeof(buf), "Bal:    0x%04X", bms_data.balance_mask);
+    UART_DMA_Send((uint8_t *)buf, len);
+    if (bms_data.balance_mask == 0) {
+        len = snprintf(buf, sizeof(buf), " (none)\r\n");
+    } else {
+        /* 閫愪綅鍒楀嚭姝ｅ湪鍧囪　鐨勫崟浣撶紪鍙?*/
+        char cell_list[48] = " (";
+        uint8_t first = 1;
+        for (int ci = 0; ci < 15; ci++) {
+            if (bms_data.balance_mask & (1u << ci)) {
+                char tmp[6];
+                if (!first) { strncat(cell_list, ",", sizeof(cell_list) - strlen(cell_list) - 1); }
+                snprintf(tmp, sizeof(tmp), "%d", ci + 1);
+                strncat(cell_list, tmp, sizeof(cell_list) - strlen(cell_list) - 1);
+                first = 0;
+            }
+        }
+        strncat(cell_list, ")\r\n", sizeof(cell_list) - strlen(cell_list) - 1);
+        len = snprintf(buf, sizeof(buf), "%s", cell_list);
+    }
+    UART_DMA_Send((uint8_t *)buf, len);
+
+    len = snprintf(buf, sizeof(buf),
+                   "Temp:   %.1f C (raw=%.1f, ok=%d, bad=%u)\r\n",
+                   bms_data.temp_degC,
+                   bms_data.temp_raw_degC,
+                   bms_data.temp_valid,
+                   bms_data.temp_invalid_cnt);
+    UART_DMA_Send((uint8_t *)buf, len);
+
+    len = snprintf(buf, sizeof(buf), "Curr:   %d mA\r\n", bms_data.current_mA);
+    UART_DMA_Send((uint8_t *)buf, len);
+
+    len = snprintf(buf, sizeof(buf), "CHG: %s  DSG: %s\r\n",
+                   bms_data.chg_on ? "ON" : "OFF",
+                   bms_data.dsg_on ? "ON" : "OFF");
+    UART_DMA_Send((uint8_t *)buf, len);
+
+    /* 淇濇姢鐘舵€佹墦鍗?*/
+    len = snprintf(buf, sizeof(buf), "Prot: OV=%d UV=%d OC=%d OT=%d\r\n",
+                   g_prot.ov_flag, g_prot.uv_flag,
+                   g_prot.oc_flag, g_prot.ot_flag);
+    UART_DMA_Send((uint8_t *)buf, len);
+
+    len = snprintf(buf, sizeof(buf), "HW:   OV=%d UV=%d SCD=%d OCD=%d\r\n",
+                   g_prot.hw_ov, g_prot.hw_uv,
+                   g_prot.hw_scd, g_prot.hw_ocd);
+    UART_DMA_Send((uint8_t *)buf, len);
+
+    len = snprintf(buf, sizeof(buf), "GAIN:   %d uV, Offset: %d mV\r\n", bms_data.adc_gain, bms_data.adc_offset);
+    UART_DMA_Send((uint8_t *)buf, len);
+
+    len = snprintf(buf, sizeof(buf),
+                   "Filter: win=%d cell_db=%dmV temp_db=%.1fC\r\n",
+                   BQ_FILTER_WINDOW_SIZE,
+                   BQ_CELL_DEBOUNCE_MV,
+                   BQ_TEMP_DEBOUNCE_C);
+    UART_DMA_Send((uint8_t *)buf, len);
+
+    len = snprintf(buf, sizeof(buf), "========================\r\n");
+    UART_DMA_Send((uint8_t *)buf, len);
+}

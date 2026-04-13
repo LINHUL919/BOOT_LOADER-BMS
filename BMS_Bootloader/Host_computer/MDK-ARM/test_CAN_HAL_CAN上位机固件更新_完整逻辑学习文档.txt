@@ -1,0 +1,816 @@
+﻿================================================================================
+         test_CAN_HAL  CAN上位机固件更新  完整逻辑学习文档
+================================================================================
+  工程名称: test_CAN_HAL
+  芯片型号: STM32F103C8T6 (Cortex-M3, 64KB Flash, 20KB SRAM)
+  开发环境: Keil MDK-ARM
+  生成日期: 2026-04-12
+  基于工程真实源码自动分析生成
+================================================================================
+
+
+========================================
+一、系统角色说明
+========================================
+
+本模块是 BMS(电池管理系统) + Bootloader 方案中的【上位机(Host)端固件】。
+
+核心职责：
+  1. 存储待更新的应用程序固件（存放于自身Flash的 0x08008000 区域）
+  2. 通过 CAN 总线监听下位机(目标板)发来的更新请求("sss")
+  3. 收到请求后，将固件数据按 8字节/帧 分块通过 CAN 发送给下位机
+  4. 发送完毕后计算并发送 CRC32 校验值，供下位机验证数据完整性
+
+附加功能(当前被注释、备用)：
+  - 通过 UART 接收 PC 端发来的应用固件并写入自身 Flash（App_bootloader模块）
+  - 该模式用于"先把新固件灌入上位机，再由上位机通过CAN转发给下位机"
+
+系统拓扑：
+
+  +-----------+    UART     +--------------+    CAN Bus    +--------------+
+  |   PC端    | ----------> |  上位机(本机) | -----------> |  下位机/目标 |
+  | 串口工具  |  115200bps  | STM32F103C8  |   250kbps    | STM32+BMS    |
+  +-----------+             +--------------+               +--------------+
+                            Flash布局:                      bootloader区
+                            0x08000000 本机程序              接收CAN数据
+                            0x08008000 待发送的APP           写入Flash
+                                                            CRC校验后跳转
+
+
+========================================
+二、内存/Flash/外设地址划分图
+========================================
+
+  Flash 地址空间 (64KB = 0x10000)
+  +-----------------------------------------------------+
+  | 0x08000000 |  本机上位机程序 (Bootloader+上位机逻辑) | 32KB
+  |            |  链接脚本: 0x08000000 ~ 0x0800FFFF      |
+  |            |  包含中断向量表、代码、只读数据          |
+  +------------+-----------------------------------------+
+  | 0x08008000 |  应用程序存储区 (待发送给下位机的固件)   | 32KB
+  |            |  APP_START_ADDRESS = 0x08008000          |
+  |            |  APP_END_ADDRESS   = 0x08010000          |
+  |            |  每页1KB, 共32页 (APP_PAGE_COUNT=32)     |
+  +------------+-----------------------------------------+
+  | 0x08010000 |  Flash结束                               |
+  +-----------------------------------------------------+
+
+  SRAM 地址空间 (20KB = 0x5000)
+  +-----------------------------------------------------+
+  | 0x20000000 |  RW数据 + ZI数据 + 堆栈                 | 20KB
+  |            |  链接脚本: 0x20000000 ~ 0x20004FFF      |
+  +-----------------------------------------------------+
+
+  外设基地址 (APB1/APB2)
+  +-----------------------------------------------------+
+  | 0x40000000 |  APB1 总线: CAN1 (bxCAN)               |
+  | 0x40006400 |  CAN1 基地址                            |
+  +------------+-----------------------------------------+
+  | 0x40010000 |  APB2 总线                              |
+  | 0x40013800 |  USART1 基地址                          |
+  +------------+-----------------------------------------+
+  | 0x40023000 |  AHB 总线: CRC 模块                     |
+  +-----------------------------------------------------+
+
+  链接脚本 (test_CAN_HAL.sct):
+    LR_IROM1  0x08000000  0x00010000   ; 加载域: 64KB Flash全部
+    ER_IROM1  0x08000000  0x00010000   ; 执行域: Flash
+    RW_IRAM1  0x20000000  0x00005000   ; 数据域: 20KB SRAM
+
+  [已确认无冲突]
+  虽然 .sct 文件中写的是 0x10000(64KB)，但 Keil Target 设置中
+  IROM1 = 0x08000000, Size = 0x8000(32KB)，Keil 使用 Target Dialog
+  的内存布局覆盖 .sct，实际程序空间为 0x08000000~0x08007FFF，
+  与 0x08008000 应用存储区不冲突。
+
+
+
+========================================
+  引脚使用总览表
+========================================
+
+  +-------+----------+------------------+--------+--------+------+-------+
+  | 引脚  | 端口     | 功能             | 模式   | 上下拉 | 速度 | 来源  |
+  +-------+----------+------------------+--------+--------+------+-------+
+  | PA9   | GPIOA    | USART1_TX        | AF_PP  | 无     | 高速 |usart.c|
+  | PA10  | GPIOA    | USART1_RX        | INPUT  | 无     | -    |usart.c|
+  | PA11  | GPIOA    | CAN1_RX          | INPUT  | 无     | -    | can.c |
+  | PA12  | GPIOA    | CAN1_TX          | AF_PP  | 无     | 高速 | can.c |
+  | PA13  | GPIOA    | SWDIO (调试)     | AF     | -      | -    | msp.c |
+  | PA14  | GPIOA    | SWCLK (调试)     | AF     | -      | -    | msp.c |
+  | PD0   | GPIOD    | OSC_IN (HSE)     | 晶振   | -      | -    |系统   |
+  | PD1   | GPIOD    | OSC_OUT (HSE)    | 晶振   | -      | -    |系统   |
+  +-------+----------+------------------+--------+--------+------+-------+
+
+  引脚冲突检查: 无冲突。PA9/PA10用于UART, PA11/PA12用于CAN, 互不重叠。
+  JTAG已禁用(NOJTAG), 释放PA15/PB3/PB4可作通用IO(当前未使用)。
+
+
+========================================
+四、完整调用树
+========================================
+
+4.1 树状调用图（带注释）
+---------------------------------------------------------------------------
+当前启用模式: CAN固件分发 (App_update)
+
+main()                                          [Core/Src/main.c]
+├── HAL_Init()                                   [HAL库] 初始化Flash/SysTick
+├── SystemClock_Config()                         [Core/Src/main.c]
+│   ├── HAL_RCC_OscConfig()                      HSE=8MHz, PLL×9=72MHz
+│   └── HAL_RCC_ClockConfig()                    AHB/1, APB1/2, APB2/1
+├── MX_GPIO_Init()                               [Core/Src/gpio.c]
+│   └── __HAL_RCC_GPIOx_CLK_ENABLE()            使能GPIOA/C/D时钟
+├── MX_CAN_Init()                                [Core/Src/can.c]
+│   ├── HAL_CAN_Init()                           CAN1参数: Prescaler=36
+│   └── HAL_CAN_MspInit()                        PA11输入/PA12推挽, CAN1时钟
+├── MX_USART1_UART_Init()                        [Core/Src/usart.c]
+│   ├── HAL_UART_Init()                          USART1: 115200/8N1
+│   └── HAL_UART_MspInit()                       PA9推挽/PA10输入, USART1时钟+中断
+├── MX_CRC_Init()                                [Core/Src/crc.c]
+│   ├── HAL_CRC_Init()                           CRC硬件模块
+│   └── HAL_CRC_MspInit()                        CRC时钟使能
+├── App_update_init()                            [appliaction/app_update.c]
+│   ├── printf("APP_update_init")                通过fputc->USART1
+│   ├── CAN_Init()                               [interface/Int_can.c]
+│   │   ├── HAL_CAN_ConfigFilter()               过滤器Bank0, 接受所有ID
+│   │   └── HAL_CAN_Start()                      启动CAN外设
+│   └── total_length = 1024                      默认固件长度(如未预设)
+│
+└── while(1) 主循环
+    └── App_update_work()                        [appliaction/app_update.c]
+        ├── case WAIT_FOR_REQUEST:
+        │   └── App_update_wait_for_request()
+        │       ├── CAN_ReceiveData()            [interface/Int_can.c]
+        │       │   ├── HAL_CAN_GetRxFifoFillLevel()  查询FIFO0消息数
+        │       │   └── HAL_CAN_GetRxMessage()        逐条读取
+        │       └── strcmp(data, "sss")           匹配ID=0的更新口令
+        │           └── -> 切换到 SENDING_APP
+        │
+        └── case SENDING_APP:
+            └── App_update_send_app()
+                ├── 从Flash读取8字节             *(volatile uint8_t*)(0x08008000+offset)
+                ├── CAN_SendData(ID=1, data, len)
+                │   └── HAL_CAN_AddTxMessage()   等待邮箱空闲后发送
+                ├── 每256字节 HAL_Delay(100)      降速等待接收端处理
+                ├── 全部发完 HAL_Delay(2100)      等待末尾数据到达
+                ├── App_crc_cal()                [static, app_update.c]
+                │   ├── __HAL_CRC_DR_RESET()     复位CRC数据寄存器
+                │   └── HAL_CRC_Calculate()      计算32位CRC
+                └── CAN_SendData(ID=1, CRC, 4)   发送4字节CRC值
+
+
+备用模式: UART固件接收 (App_bootloader, 当前注释)
+
+main() [如取消注释]
+├── App_bootloader_init()                        [appliaction/App_bootloader.c]
+│   └── printf("Bootloader started")
+├── while(1)
+│   └── App_bootloader_work()                    [已修正拼写]
+│       ├── case INIT:
+│       │   └── App_bootloader_run()
+│       │       └── HAL_UARTEx_ReceiveToIdle()   阻塞等待"start:len"
+│       ├── case RUN:
+│       │   ├── Int_bootloader_erase()           [interface/int_bootloader.c]
+│       │   │   ├── HAL_FLASH_Unlock()
+│       │   │   ├── HAL_FLASHEx_Erase()         擦除32页(0x08008000起)
+│       │   │   └── HAL_FLASH_Lock()
+│       │   └── Int_bootloader_rec_app()         [interface/int_bootloader.c]
+│       │       └── HAL_UARTEx_ReceiveToIdle_IT() 启动中断接收
+│       ├── case REC_DATA:
+│       │   └── App_bootloader_rec_data()        检测2秒超时
+│       └── case CHECK_DATA:
+│           └── App_bootloader_check_data()      校验长度一致性
+│               └── 失败: NVIC_SystemReset()     系统复位
+
+
+4.2 并行中断入口关系（箭头简图）
+---------------------------------------------------------------------------
+
+  SysTick (1ms)
+    SysTick_Handler()  ->  HAL_IncTick()  ->  更新uwTick全局计数器
+
+  USART1中断 (仅App_bootloader模式启用)
+    USART1_IRQHandler()
+      -> HAL_UART_IRQHandler(&huart1)
+         -> HAL_UARTEx_RxEventCallback(&huart1, Size)  [int_bootloader.c]
+            -> 写Flash + 重新启动中断接收
+
+  CAN接收 (当前模式: 轮询, 无中断)
+    CAN1未配置接收中断, 由 CAN_ReceiveData() 主循环轮询FIFO0
+
+  注意: stm32f1xx_it.c 中未注册 USB_LP_CAN1_RX0_IRQHandler,
+        CAN收发完全依赖轮询方式。
+
+
+
+========================================
+三、文件清单与各文件职责
+========================================
+
+本工程分为三层架构: Core层(HAL) -> Interface层(驱动封装) -> Application层(业务)
+
++--------------------------------------------------------------------------+
+| 序号 | 文件名               | 层级        | 核心职责                     |
++------+----------------------+-------------+------------------------------+
+|  1   | main.c / main.h      | Core        | 程序入口、时钟配置、主循环   |
+|  2   | can.c / can.h         | Core        | CAN1外设HAL初始化            |
+|  3   | usart.c / usart.h     | Core        | USART1外设HAL初始化          |
+|  4   | crc.c / crc.h         | Core        | CRC外设HAL初始化             |
+|  5   | gpio.c / gpio.h       | Core        | GPIO时钟使能                 |
+|  6   | stm32f1xx_it.c/.h     | Core        | 中断服务函数                 |
+|  7   | stm32f1xx_hal_msp.c   | Core        | MSP底层初始化(AFIO/JTAG)     |
+|  8   | system_stm32f1xx.c    | Core        | 系统时钟变量管理             |
+|  9   | Int_can.c / Int_can.h | Interface   | CAN过滤器/收发封装           |
+| 10   | int_bootloader.c/.h   | Interface   | UART接收+Flash写入驱动       |
+| 11   | app_update.c/.h       | Application | CAN固件分发状态机(当前启用)  |
+| 12   | App_bootloader.c/.h   | Application | UART固件接收状态机(备用)     |
++------+----------------------+-------------+------------------------------+
+
+---------------------------------------------------------------------------
+【文件1】main.c / main.h  (Core/Src/main.c, Core/Inc/main.h)
+---------------------------------------------------------------------------
+  职责: 程序入口, 系统时钟配置, 外设初始化调度, 主循环
+
+  函数列表:
+    - main()             : 入口, 依次初始化HAL/时钟/GPIO/CAN/UART/CRC,
+                           调用App_update_init(), 主循环调App_update_work()
+    - SystemClock_Config(): HSE=8MHz, PLL*9 -> SYSCLK=72MHz
+                           AHB=72MHz, APB1=36MHz, APB2=72MHz
+    - Error_Handler()    : 关中断死循环
+
+  引脚配置: 无直接引脚操作(由各外设MSP完成)
+
+---------------------------------------------------------------------------
+【文件2】can.c / can.h  (Core/Src/can.c, Core/Inc/can.h)
+---------------------------------------------------------------------------
+  职责: CAN1外设初始化, GPIO引脚配置
+
+  函数列表:
+    - MX_CAN_Init()      : CAN1参数初始化
+    - HAL_CAN_MspInit()  : CAN1底层GPIO+时钟配置
+    - HAL_CAN_MspDeInit(): CAN1反初始化
+
+  | can.c                | CAN1: 200kbps/Normal模式                             |
+  |                      | PA11(RX) 输入模式 无上下拉                            |
+  |                      | PA12(TX) 复用推挽 高速                                |
+  |                      | 自动重传:禁用  自动离线恢复:启用  自动唤醒:启用       |
+
+  CAN波特率计算:
+    APB1时钟 = 36MHz, Prescaler = 36 -> TQ = 1us
+    BS1=2TQ, BS2=2TQ, SJW=1TQ
+    1位 = 1(同步) + 2(BS1) + 2(BS2) = 5 TQ
+    波特率 = 1MHz / 5 = 200kbps
+    !! 注意 !! 实际波特率200kbps, 须确认下位机也是200kbps
+
+---------------------------------------------------------------------------
+【文件3】usart.c / usart.h  (Core/Src/usart.c, Core/Inc/usart.h)
+---------------------------------------------------------------------------
+  职责: USART1初始化, GPIO引脚配置, printf重定向
+
+  函数列表:
+    - MX_USART1_UART_Init() : USART1参数初始化
+    - HAL_UART_MspInit()    : USART1底层GPIO+时钟+中断
+    - HAL_UART_MspDeInit()  : USART1反初始化
+    - fputc()               : printf重定向到USART1(阻塞发送)
+
+  | usart.c              | USART1: 115200/8N1/收发                               |
+  |                      | PA9(TX)  复用推挽 高速                                |
+  |                      | PA10(RX) 输入模式 无上下拉                            |
+  |                      | 16倍过采样, 无硬件流控                                |
+  |                      | 中断优先级: 抢占0 子优先级0 (最高)                    |
+
+---------------------------------------------------------------------------
+【文件4】crc.c / crc.h  (Core/Src/crc.c, Core/Inc/crc.h)
+---------------------------------------------------------------------------
+  职责: 硬件CRC模块初始化
+  函数: MX_CRC_Init(), HAL_CRC_MspInit(), HAL_CRC_MspDeInit()
+  引脚: 无(内部运算模块)
+  参数: STM32F1 CRC固定多项式 0x04C11DB7 (CRC-32/MPEG-2)
+
+---------------------------------------------------------------------------
+【文件5】gpio.c / gpio.h  (Core/Src/gpio.c, Core/Inc/gpio.h)
+---------------------------------------------------------------------------
+  职责: 通用GPIO端口时钟使能
+  函数: MX_GPIO_Init() -> 使能GPIOA/GPIOC/GPIOD时钟
+
+---------------------------------------------------------------------------
+【文件6】stm32f1xx_it.c/.h  (Core/Src/, Core/Inc/)
+---------------------------------------------------------------------------
+  职责: 中断向量入口函数
+  关键函数:
+    - SysTick_Handler()   -> HAL_IncTick()
+    - USART1_IRQHandler() -> HAL_UART_IRQHandler(&huart1)
+  其余: NMI/HardFault/MemManage/BusFault/UsageFault 均为死循环
+
+---------------------------------------------------------------------------
+【文件7】stm32f1xx_hal_msp.c  (Core/Src/)
+---------------------------------------------------------------------------
+  职责: HAL全局MSP初始化
+  函数: HAL_MspInit() -> 使能AFIO/PWR时钟, 禁用JTAG保留SWD
+  引脚: __HAL_AFIO_REMAP_SWJ_NOJTAG() 释放PA15/PB3/PB4
+
+---------------------------------------------------------------------------
+【文件8】Int_can.c / Int_can.h  (MDK-ARM/interface/)
+---------------------------------------------------------------------------
+  职责: CAN接口封装, 过滤器配置, 收发函数
+
+  函数列表:
+    - CAN_Init()        : 过滤器Bank0(掩码全0,接受所有ID), 启动CAN
+    - CAN_SendData()    : 发送标准数据帧, 等待3个邮箱全空后发送
+    - CAN_ReceiveData() : 轮询FIFO0, 最多3帧
+
+  结构体: CAN_MessageTypeDef { RxHeader, data[8] }
+  过滤器: FilterBank=0, FIFO0, SlaveStartFilterBank=14
+
+---------------------------------------------------------------------------
+【文件9】int_bootloader.c/.h  (MDK-ARM/interface/)
+---------------------------------------------------------------------------
+  职责: UART接收固件+写入Flash(App_bootloader模式使用)
+
+  函数列表:
+    - HAL_UARTEx_RxEventCallback() : UART空闲帧回调, 数据写Flash
+    - Int_bootloader_rec_app()     : 启动UART中断接收
+    - Int_bootloader_erase()       : 擦除应用区32页Flash
+
+  宏定义:
+    BOOTLOADER_UART_RECEIVE_BUFFER_SIZE = 512
+    APP_START_ADDRESS = 0x08008000
+    APP_END_ADDRESS   = 0x08010000
+    FLASH_PAGE_SIZE   = 0x400 (1KB)
+    APP_PAGE_COUNT    = 32
+
+  Flash写入: F103半字(16位)写入, 奇数字节高位补0xFF
+
+---------------------------------------------------------------------------
+【文件10】app_update.c/.h  (MDK-ARM/appliaction/)
+---------------------------------------------------------------------------
+  职责: 【当前启用】CAN固件分发主程序
+
+  函数列表:
+    - App_update_init()             : 初始化CAN, 默认固件长度1024
+    - App_update_wait_for_request() : 监听CAN ID=0的"sss"请求
+    - App_update_send_app()         : 分块发送固件 + 发CRC
+    - App_crc_cal() [static]        : 计算Flash区CRC32
+    - App_update_work()             : 状态机主调度
+
+  宏定义:
+    app_update_request    = "sss"   (更新触发口令)
+    app_update_request_ID = 1       (发送数据帧ID)
+
+---------------------------------------------------------------------------
+【文件11】App_bootloader.c/.h  (MDK-ARM/appliaction/)
+---------------------------------------------------------------------------
+  职责: 【备用/注释中】UART固件接收状态机
+
+  函数列表:
+    - App_bootloader_init()       : 打印启动日志
+    - App_bootloader_run()        : 等待"start:len"命令
+    - App_bootloader_rec_data()   : 2秒超时检测
+    - App_bootloader_check_data() : 校验接收长度
+    - App_bootloader_work()       : 状态机主调度(拼写已修正)
+
+  宏: APP_BOOTLOADER_UART_RECEIVE_BUFFER_SIZE = 64
+
+========================================
+五、流程图（文本框+箭头）
+========================================
+
+5.1 主流程: CAN固件分发 (当前启用)
+---------------------------------------------------------------------------
+
+  +-------------------+
+  |    上电/复位      |
+  +--------+----------+
+           |
+           v
+  +-------------------+
+  |  HAL_Init()       |
+  |  SystemClock 72MHz|
+  |  GPIO/CAN/UART/CRC|
+  +--------+----------+
+           |
+           v
+  +-------------------+
+  | App_update_init() |
+  | - CAN过滤器配置   |
+  | - CAN启动         |
+  | - 默认len=1024    |
+  +--------+----------+
+           |
+           v
+  +=============================+
+  | 主循环: App_update_work()   |
+  +=============================+
+           |
+           v
+  +----------------------------+       +----------------------------+
+  | 状态: WAIT_FOR_REQUEST     |       | 状态: SENDING_APP          |
+  | CAN轮询FIFO0              |       |                            |
+  | 检查ID=0, 数据="sss"      |       | 从Flash 0x08008000读8字节  |
+  +-------------+--------------+       | CAN_SendData(ID=1)         |
+                |                      | 每256B延时100ms            |
+       收到"sss"?                      +-------------+--------------+
+       /        \                                    |
+     否/         \是                           全部发完?
+     |            |                            /       \
+     v            v                          否/        \是
+  (继续轮询)  切换状态 -------->           (继续发)     |
+                                                        v
+                                               +------------------+
+                                               | HAL_Delay(2100)  |
+                                               | 计算CRC32        |
+                                               | 发送CRC 4字节    |
+                                               +--------+---------+
+                                                        |
+                                                        v
+                                               +------------------+
+                                               | sent_length = 0  |
+                                               | 回到WAIT状态     |
+                                               | (可重复发送)     |
+                                               +------------------+
+
+  发送数据帧格式:
+    CAN ID = 1 (app_update_request_ID)
+    DLC = 1~8字节 (最后一帧可能<8)
+
+  CRC帧格式:
+    CAN ID = 1, DLC = 4字节
+    data[0]=CRC[31:24] data[1]=CRC[23:16]
+    data[2]=CRC[15:8]  data[3]=CRC[7:0]  (大端序)
+
+
+5.2 备用流程: UART固件接收 (App_bootloader, 注释中)
+---------------------------------------------------------------------------
+
+  +-------------------+
+  |  App_bootloader   |
+  |  _init()          |
+  +--------+----------+
+           |
+           v
+  +-------------------+     格式错误
+  | STATE: INIT       |<-----------+
+  | 阻塞等UART输入    |            |
+  | 解析"start:len"   |            |
+  +--------+----------+            |
+           |                       |
+       格式正确?                   |
+       /        \                  |
+     否/         \是               |
+     v            v                |
+  (提示重输)---->+                 |
+              +-------------------+|
+              | STATE: RUN        ||
+              | 擦除Flash 32页    ||
+              | 启动UART中断接收  ||
+              +--------+----------+|
+                       |           |
+                       v           |
+              +-------------------+|
+              | STATE: REC_DATA   ||
+              | 中断回调写Flash   ||
+              | 检测2秒超时       ||
+              +--------+----------+|
+                       |           |
+                   2秒超时         |
+                       v           |
+              +-------------------+|
+              | STATE: CHECK_DATA ||
+              | 比较长度一致性    ||
+              +--------+----------+|
+                      / \          |
+                   一致/  \不一致--+
+                    /      NVIC_SystemReset()
+                   v
+          +------------+
+          | COMPLITE   |
+          | 退出while  |
+          +------------+
+
+  UART中断回调写Flash流程:
+    HAL_UARTEx_RxEventCallback()
+      -> 更新 last_receive_time
+      -> total_length += Size
+      -> 越界检查(>0x08010000则return)
+      -> HAL_FLASH_Unlock()
+      -> for i+=2: 半字写入(奇数字节补0xFF)
+      -> flash_write_offset偶数对齐
+      -> HAL_FLASH_Lock()
+      -> 清空buffer -> 重启中断接收
+
+========================================
+六、状态机/枚举值/宏定义速查表
+========================================
+
+6.1 AppUpdateState_t (app_update.h) -- 当前启用
+---------------------------------------------------------------------------
+  +------+-------------------------------+------------------------------+
+  | 值   | 枚举名                        | 含义                         |
+  +------+-------------------------------+------------------------------+
+  |  0   | APP_UPDATE_WAIT_FOR_REQUEST   | 等待下位机发"sss"请求        |
+  |  1   | APP_UPDATE_SENDING_APP        | 正在分块发送固件数据         |
+  +------+-------------------------------+------------------------------+
+
+6.2 AppBootloaderState (App_bootloader.h) -- 备用
+---------------------------------------------------------------------------
+  +------+------------------------------------+----------------------------+
+  | 值   | 枚举名                             | 含义                       |
+  +------+------------------------------------+----------------------------+
+  |  0   | APP_BOOTLOADER_STATE_INIT          | 等待用户输入start:len      |
+  |  1   | APP_BOOTLOADER_STATE_RUN           | 擦除Flash+启动接收         |
+  |  2   | APP_BOOTLOADER_STATE_REC_DATA      | 接收数据中(中断回调写入)   |
+  |  3   | APP_BOOTLOADER_STATE_CHECK_DATA    | 校验接收数据长度           |
+  |  4   | APP_BOOTLOADER_STATE_COMPLITE      | 接收完成(注意拼写COMPLITE) |
+  +------+------------------------------------+----------------------------+
+
+6.3 宏定义速查表
+---------------------------------------------------------------------------
+  +--------------------------------------+----------------+----------------+
+  | 宏名                                 | 值             | 所在文件       |
+  +--------------------------------------+----------------+----------------+
+  | APP_START_ADDRESS                    | 0x08008000     | int_bootloader.h|
+  | APP_END_ADDRESS                      | 0x08010000     | int_bootloader.h|
+  | FLASH_PAGE_SIZE                      | 0x400 (1KB)    | int_bootloader.h|
+  | APP_PAGE_COUNT                       | 32             | int_bootloader.h|
+  | BOOTLOADER_UART_RECEIVE_BUFFER_SIZE  | 512            | int_bootloader.h|
+  | APP_BOOTLOADER_UART_RECEIVE_BUFFER_SIZE | 64          | App_bootloader.h|
+  | app_update_request                   | "sss"          | app_update.h   |
+  | app_update_request_ID                | 1              | app_update.h   |
+  +--------------------------------------+----------------+----------------+
+
+6.4 CAN参数速查
+---------------------------------------------------------------------------
+  Prescaler=36  SJW=1TQ  BS1=2TQ  BS2=2TQ
+  Mode=NORMAL  AutoBusOff=ON  AutoWakeUp=ON  AutoRetransmit=OFF
+  FilterBank=0  掩码=0x0000(全通)  FIFO0
+  波特率 = 36MHz / 36 / 5 = 200kbps
+
+6.5 UART参数速查
+---------------------------------------------------------------------------
+  BaudRate=115200  WordLength=8bit  StopBits=1  Parity=None
+  Mode=TX_RX  HwFlowCtl=None  OverSampling=16x
+  中断: 抢占优先级0, 子优先级0
+
+========================================
+七、关键全局变量总览
+========================================
+
++------------------------+---------------------+------------+------------------------------+--------------------------+--------------------------+
+| 变量名                 | 所在文件            | 类型       | 作用                         | 谁写它                   | 谁读它                   |
++------------------------+---------------------+------------+------------------------------+--------------------------+--------------------------+
+| hcan                   | can.c               |CAN_Handle  | CAN1句柄                    | MX_CAN_Init              | Int_can全部函数          |
+| huart1                 | usart.c             |UART_Handle | USART1句柄                  | MX_USART1_UART_Init      | printf/回调/bootloader   |
+| hcrc                   | crc.c               |CRC_Handle  | CRC句柄                     | MX_CRC_Init              | App_crc_cal              |
+| app_update_state       | app_update.c        |AppUpdate   | 当前更新状态机状态           | init/wait/send           | App_update_work          |
+|                        |                     |State_t     |                              |                          |                          |
+| can_msgs[3]            | app_update.c        |CAN_Message | CAN接收缓冲(最多3帧)        | CAN_ReceiveData          | wait_for_request         |
+| msg_count              | app_update.c        |uint8_t     | 本次轮询收到的帧数           | CAN_ReceiveData          | wait_for_request         |
+| sent_length            | app_update.c        |uint16_t    | 已发送字节计数               | send_app/init            | send_app                 |
+| data_buffer[8]         | app_update.c        |uint8_t[]   | CAN发送数据缓冲             | send_app                 | CAN_SendData             |
+| total_length           | int_bootloader.c    |uint16_t    | 累计接收字节数               | RxEventCallback/init     | check_data/send_app      |
+| receive_buffer[512]    | int_bootloader.c    |uint8_t[]   | UART接收缓冲                | RxEventCallback          | RxEventCallback(写Flash) |
+| receive_length         | int_bootloader.c    |uint16_t    | 单次接收长度                 | RxEventCallback          | RxEventCallback          |
+| flash_write_offset     | int_bootloader.c    |uint32_t    | Flash写入偏移量              | RxEventCallback/init     | RxEventCallback          |
+| last_receive_time      | int_bootloader.c    |uint32_t    | 上次收到数据的时间戳(ms)     | RxEventCallback          | rec_data(超时判断)       |
+| app_bootloader_state   | App_bootloader.c    |AppBoot     | bootloader状态机状态         | init/run/rec/check       | App_bootloader_work      |
+|                        |                     |loaderState |                              |                          |                          |
+| app_rec_start_buffer   | App_bootloader.c    |uint8_t[64] | 接收start命令缓冲           | bootloader_run           | bootloader_run           |
+| app_total_length       | App_bootloader.c    |uint16_t    | 用户期望的固件总长度         | bootloader_run           | check_data               |
++------------------------+---------------------+------------+------------------------------+--------------------------+--------------------------+
+
+extern引用关系:
+  - app_update.c      extern total_length      <- int_bootloader.c
+  - App_bootloader.c  extern last_receive_time  <- int_bootloader.c
+  - App_bootloader.c  extern total_length       <- int_bootloader.c
+  - stm32f1xx_it.c    extern huart1             <- usart.c
+
+========================================
+八、实际使用步骤
+========================================
+
+8.1 最小可跑通步骤 (CAN固件分发模式，当前启用)
+---------------------------------------------------------------------------
+
+  1) 硬件连接要求:
+     +-------------+          CAN总线           +--------------+
+     | 上位机板    |    PA12(TX) ---+--- TX      | 下位机/目标  |
+     | STM32F103C8 |    PA11(RX) ---+--- RX      | STM32+BMS    |
+     |             |    GND     -------- GND      |              |
+     +-------------+          (需CAN收发器)       +--------------+
+     |  PA9(TX)  ---|--- USB转串口(RX) --- PC
+     |  PA10(RX) ---|--- USB转串口(TX) --- PC
+     |  GND      ---|--- USB转串口GND
+     +-------------+
+
+     !! CAN总线两端需各接120欧终端电阻 !!
+     !! 需要CAN收发器芯片(如TJA1050/SN65HVD230) !!
+
+  2) 编译下载:
+     - 用Keil打开 test_CAN_HAL.uvprojx
+     - 编译(F7), 无错误后下载(F8)
+     - 确保下载器为ST-Link/SWD模式
+
+  3) 串口/调试器参数:
+     - 串口: 115200bps, 8数据位, 无校验, 1停止位
+     - 打开串口终端(SecureCRT/SSCOM/MobaXterm等)
+     - 连接PA9/PA10对应的串口
+
+  4) 触发操作:
+     a. 上位机上电后串口输出:
+        "APP_update_init"
+        "APP_update_wait_for_request"
+        "Please set the total length..."
+     b. 下位机Bootloader发送CAN帧:
+        ID=0, 数据="sss" (3字节ASCII)
+     c. 上位机收到后自动开始发送固件
+
+  5) 预期输出/现象:
+     - 串口打印 "Received app update request"
+     - 串口打印 "App_update_send_app"
+     - CAN总线上连续出现ID=1的数据帧(8字节/帧)
+     - 每256字节有约100ms静默间隔
+     - 最后一帧为4字节CRC值
+     - 回到等待状态,可再次触发
+
+  6) 验证方法:
+     - 用CAN分析仪/逻辑分析仪抓取CAN帧
+     - 确认数据与Flash 0x08008000处内容一致
+     - 确认末尾CRC帧正确
+     - 在下位机端验证CRC通过后跳转APP成功
+
+8.2 备用模式: UART固件接收 (需取消main.c中注释)
+---------------------------------------------------------------------------
+  1) 取消main.c中App_bootloader相关注释
+  2) 串口发送 "start:1024" (数字为固件字节数)
+  3) 用串口工具发送bin文件
+  4) 等待2秒超时后自动校验长度
+  5) 串口输出 "Data received successfully"
+
+8.3 常见失败现象与排查
+---------------------------------------------------------------------------
+  +----------------------------+--------------------------------------------+
+  | 失败现象                   | 排查入口                                   |
+  +----------------------------+--------------------------------------------+
+  | 串口无任何输出             | 1.检查PA9/PA10接线是否反接                 |
+  |                            | 2.确认波特率115200                         |
+  |                            | 3.检查HSE晶振8MHz是否起振                  |
+  +----------------------------+--------------------------------------------+
+  | 打印init但无法收到CAN请求  | 1.检查CAN收发器供电和接线                  |
+  |                            | 2.确认波特率一致(上位机200kbps)            |
+  |                            | 3.检查下位机发送ID=0,数据="sss"            |
+  |                            | 4.用CAN分析仪确认总线有数据                |
+  +----------------------------+--------------------------------------------+
+  | 收到请求但下位机CRC失败    | 1.检查0x08008000处是否有有效固件            |
+  |                            | 2.total_length是否匹配实际固件大小          |
+  |                            | 3.确认大端序CRC解析一致                    |
+  |                            | 4.下位机CRC多项式是否为0x04C11DB7          |
+  +----------------------------+--------------------------------------------+
+  | Flash写入失败(bootloader)  | 1.检查Flash是否已解锁                      |
+  |                            | 2.确认0x08008000区域已擦除                 |
+  |                            | 3.检查写入地址是否对齐(半字)               |
+  +----------------------------+--------------------------------------------+
+  | UART接收数据丢失           | 1.降低PC端发送速率                         |
+  |                            | 2.检查receive_buffer(512)是否够用          |
+  |                            | 3.确认空闲帧检测正常                       |
+  +----------------------------+--------------------------------------------+
+
+========================================
+九、芯片相关的编程要点备忘
+========================================
+
+9.1 时钟树与分频关系
+---------------------------------------------------------------------------
+  HSE(8MHz) -> PLL x9 -> SYSCLK = 72MHz
+                |
+                +-> AHB  /1 = 72MHz  -> Flash, SRAM, DMA, CRC
+                +-> APB1 /2 = 36MHz  -> CAN1, TIM2-4, USART2-3
+                +-> APB2 /1 = 72MHz  -> USART1, GPIO, AFIO, ADC
+                +-> SysTick  = 72MHz / 8 = 9MHz (或72MHz直接)
+
+  Flash等待周期: FLASH_LATENCY_2 (72MHz需要2个等待周期)
+
+9.2 中断优先级分组与抢占关系
+---------------------------------------------------------------------------
+  STM32F1 HAL默认: NVIC_PRIORITYGROUP_4 (4位抢占, 0位子优先级)
+  但本工程未显式调用 HAL_NVIC_SetPriorityGroup()，
+  HAL_Init()默认设置为 NVIC_PRIORITYGROUP_4。
+
+  当前中断配置:
+    +-------------------+--------+---------+--------+
+    | 中断源            | 抢占级 | 子优先级| 说明   |
+    +-------------------+--------+---------+--------+
+    | SysTick           |  15    |   0     | 最低   |
+    | USART1_IRQn       |   0    |   0     | 最高   |
+    +-------------------+--------+---------+--------+
+
+  CAN未配置中断(纯轮询), 不占中断资源。
+  SysTick默认优先级最低(15), UART最高(0), 不会互相抢占问题。
+
+9.3 外设初始化顺序依赖
+---------------------------------------------------------------------------
+  必须遵循以下顺序:
+    1. HAL_Init()        -- 初始化Flash接口和SysTick
+    2. SystemClock_Config() -- PLL/时钟树必须先配好
+    3. MX_GPIO_Init()    -- GPIO时钟必须在外设引脚配置之前使能
+    4. MX_CAN_Init()     -- CAN初始化(MspInit中配GPIO)
+    5. MX_USART1_UART_Init() -- UART初始化
+    6. MX_CRC_Init()     -- CRC初始化(无依赖,但放最后)
+    7. CAN_Init()        -- 过滤器+启动CAN(必须在MX_CAN_Init之后)
+
+  注意: CAN_Init()在App_update_init()中调用, 必须在HAL_CAN_Init()之后。
+  如果调换顺序会导致CAN外设未初始化就配置过滤器 -> HardFault。
+
+9.4 引脚复用冲突检查
+---------------------------------------------------------------------------
+  PA9  = USART1_TX  (无冲突)
+  PA10 = USART1_RX  (无冲突)
+  PA11 = CAN1_RX    (与USB_DM共用! F103的PA11同时是USB D-)
+  PA12 = CAN1_TX    (与USB_DP共用! F103的PA12同时是USB D+)
+
+  !! 注意 !! PA11/PA12 在 STM32F103 中 CAN 和 USB 共用引脚,
+  不能同时使用CAN和USB。本工程仅用CAN,无冲突。
+  若需同时使用USB, 需将CAN重映射到PB8(RX)/PB9(TX)。
+
+  PA13 = SWDIO (调试用, 保留)
+  PA14 = SWCLK (调试用, 保留)
+  PA15/PB3/PB4 = JTAG已释放, 可用作GPIO(当前未使用)
+
+9.5 Flash/EEPROM擦写注意事项
+---------------------------------------------------------------------------
+  STM32F103C8T6 Flash特点:
+    - 总容量: 64KB (部分实际有128KB但不保证)
+    - 页大小: 1KB (0x400)
+    - 擦除: 只能按页擦除, 不能按字节
+    - 写入: 只能半字(16位)写入, 地址必须2字节对齐
+    - 写入前必须擦除(1->0), 不能0->1
+    - 操作前 HAL_FLASH_Unlock(), 操作后 HAL_FLASH_Lock()
+    - 擦写期间 Flash 不可读(代码不能从Flash执行)
+      -> 如果在中断中擦写,主循环不能访问Flash
+      -> 本工程在中断回调中写Flash, 注意此限制
+
+  本工程应用区:
+    起始: 0x08008000 (第32页)
+    结束: 0x08010000 (第64页)
+    共32页, 32KB空间
+
+  奇数字节处理:
+    当接收字节数为奇数时, 最后一字节高位补0xFF:
+    data = buf[i] | 0xFF00
+    这意味着奇数长度的固件最后一字节后会多一个0xFF
+
+9.6 CAN通信时序要求
+---------------------------------------------------------------------------
+  - CAN发送等待所有3个邮箱空闲: while(FreeLevel < 3)
+    这保证了帧按FIFO顺序到达, 但降低了吞吐量
+  - 每256字节延时100ms: 给接收端处理+写Flash时间
+  - 发送完毕延时2100ms: 确保最后的数据帧全部到达后再发CRC
+  - CRC帧与数据帧使用相同的CAN ID(=1), 接收端需按时序区分
+
+  !! 潜在问题 !!
+  CRC帧和数据帧ID相同, 接收端区分它们的唯一方式是"超时":
+  数据帧间隔 < 2.1秒, CRC帧在数据帧结束2.1秒后到达。
+  如果CAN总线拥塞导致延迟, 可能误判。
+
+9.7 AFIO与JTAG配置
+---------------------------------------------------------------------------
+  __HAL_AFIO_REMAP_SWJ_NOJTAG(): 禁用JTAG, 仅保留SWD
+  效果: PA15/PB3/PB4 可用作普通GPIO
+  注意: 此操作在HAL_MspInit()中执行, 即HAL_Init()期间
+  如果代码跑飞导致无法SWD连接, 需要按住RESET再连接
+
+========================================
+十、改动总结
+========================================
+
+本文档为基于源码自动分析生成,未修改任何工程源码。
+以下为分析过程中发现的关键事项:
+
+【发现的配置问题/冲突】
+  1. [已确认无冲突] 链接脚本 vs 应用存储区
+     .sct 文件中写的是64KB, 但Keil Target设置IROM1=32KB(0x8000),
+     实际生效的是32KB, 程序不会覆盖0x08008000存储区
+
+  2. !! CAN波特率计算 !!
+     Prescaler=36, BS1=2TQ, BS2=2TQ
+     实际波特率 = 36MHz / 36 / (1+2+2) = 200kbps
+     非常见的250kbps, 须确认下位机配置一致
+
+  3. !! CRC帧与数据帧ID相同 !!
+     均使用CAN ID=1, 仅靠2.1秒延时区分
+     建议: 使用不同ID或在帧中加入标识字节
+
+  4. [已修正] 函数名拼写错误
+     App_bootlaoder_work() -> App_bootloader_work() 已在源码中修正
+     涉及文件: App_bootloader.c, App_bootloader.h
+
+  5. !! total_length默认值 !!
+     如未通过UART烧录过固件, total_length默认=0,
+     代码中硬编码为1024作为演示, 实际使用需修改
+
+【文件清单】(本次生成,未修改源码)
+  - test_CAN_HAL_CAN上位机固件更新_完整逻辑学习文档.txt  (本文档)
+
+================================================================================
+                              文档结束
+================================================================================

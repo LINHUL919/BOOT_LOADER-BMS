@@ -1,0 +1,869 @@
+﻿================================================================================
+  P03_bootloader_reset  出厂重置模块  完整逻辑学习文档
+  生成日期: 2026-04-12
+  芯片型号: STM32F407ZGTx
+  工程名称: P03_bootloader_reset
+================================================================================
+
+
+================================================================================
+一、系统角色说明
+================================================================================
+
+本模块是 STM32F407 Bootloader 体系中的"出厂重置程序"(Factory Reset / Default App)。
+它烧写在 Flash Sector 1 (0x08004000)，由主 Bootloader(Sector 0) 在以下场景跳转过来：
+
+  1) 用户触发"恢复出厂设置"时，主 Bootloader 擦除 Sector 3 APP 区，
+     然后跳转到本程序(Sector 1)
+  2) Sector 3 无有效 APP 时的兜底程序
+
+本模块的核心功能：
+  - 通过 USART1(115200) 接收用户发来的新固件二进制数据
+  - 将数据逐字节写入 Flash Sector 3 (0x0800C000~0x0800FFFF, 16KB)
+  - 对接收数据做长度校验(用户预先告知总字节数)
+  - 校验通过后跳转到 Sector 3 执行新 APP
+  - 校验失败则复位重来
+
+简而言之：这是一个"串口接收固件 + 写Flash + 跳转"的最小化 OTA 程序。
+
+状态机工作模式：
+  INIT ──> RUN(等待"start:len"指令) ──> REC_DATA(中断接收写Flash)
+       ──> CHECK_DATA(长度校验) ──> JUMP_TO_APP(跳转Sector3)
+
+与主 Bootloader(P02) 的协作关系：
+  ┌─────────────────┐    跳转     ┌──────────────────────┐
+  │ P02 Bootloader  │ ─────────> │ P03 Reset (本模块)   │
+  │ Sector 0        │            │ Sector 1             │
+  │ 0x08000000      │            │ 0x08004000           │
+  └─────────────────┘            └──────────┬───────────┘
+                                            │ 接收固件后跳转
+                                            v
+                                 ┌──────────────────────┐
+                                 │ 用户 APP             │
+                                 │ Sector 3             │
+                                 │ 0x0800C000           │
+                                 └──────────────────────┘
+
+
+
+================================================================================
+二、内存/Flash/外设地址划分图
+================================================================================
+
+【Flash 分区布局 (STM32F407 内置Flash 1MB)】
+
+  地址              大小     扇区       用途               本工程使用
+  ─────────────────────────────────────────────────────────────────────
+  0x08000000        16KB   Sector 0   P02 Bootloader      (主引导,非本工程)
+  0x08004000        16KB   Sector 1   P03 Reset(本模块)   ★ 本工程代码区
+  0x08008000        16KB   Sector 2   CAN更新工具(预留)    (未使用)
+  0x0800C000        16KB   Sector 3   用户APP运行区        ★ 本工程写入目标
+  0x08010000        64KB   Sector 4   (空闲/扩展)          (未使用)
+  0x08020000~       128KB  Sector5~   (空闲/扩展)          (未使用)
+  0x080FFFFF        ...    Sector11
+
+【本工程 Scatter Loading 配置】(P02_boot_loader.sct)
+
+  LR_IROM1 0x08004000 0x00004000       ; 加载域: 起始0x08004000, 大小16KB
+  ├── ER_IROM1 0x08004000 0x00004000   ; 执行域=加载域(XIP)
+  │   ├── *.o (RESET, +First)         ; 向量表在最前
+  │   ├── *(InRootPart 1 writtenSections)         ; C库初始化段
+  │   └── .ANY (+RO +XO)             ; 只读代码与数据
+  ├── RW_IRAM1 0x20000000 0x0001C000   ; 主SRAM: 112KB (RW+ZI)
+  └── RW_IRAM2 0x2001C000 0x00004000   ; 尾部SRAM: 16KB (RW+ZI)
+
+【SRAM 布局】
+
+  0x20000000 ┌─────────────────────┐
+             │ RW_IRAM1            │ 112KB  全局变量/堆/栈
+  0x2001C000 ├─────────────────────┤
+             │ RW_IRAM2            │ 16KB   溢出数据段
+  0x20020000 └─────────────────────┘
+             (总计128KB, F407ZG SRAM)
+
+【VTOR 向量表重映射】
+
+  system_stm32f4xx.c 中:
+    #define USER_VECT_TAB_ADDRESS       (已启用)
+    #define VECT_TAB_BASE_ADDRESS  FLASH_BASE   = 0x08000000
+    #define VECT_TAB_OFFSET        0x00004000U
+    => SCB->VTOR = 0x08000000 | 0x00004000 = 0x08004000
+
+  说明: 本模块的向量表位于 0x08004000, 与 Scatter 一致, 配置正确。
+
+【APP 写入目标地址】(int_bootloader.h)
+
+  #define APP_START_ADDRESS       0x0800C000   ; Sector 3 起始
+  #define APP_SECTOR3_END_ADDRESS 0x0800FFFFU  ; Sector 3 结束
+  写入方式: FLASH_TYPEPROGRAM_BYTE 逐字节写入
+
+【SRAM 校验范围】(int_bootloader.h)
+
+  #define SRAM_START_ADDRESS  0x20000000U
+  #define SRAM_END_ADDRESS    0x2001FFFFU
+  用于跳转前校验 APP 栈顶指针合法性
+
+
+================================================================================
+三、文件清单与各文件职责
+================================================================================
+
+  路径前缀说明:
+    Reset\Core\Src\       -> 核心源码 (CubeMX生成)
+    Reset\Core\Inc\       -> 核心头文件
+    Reset\interface\      -> 接口层驱动
+    Reset\MDK-ARM\application\ -> 应用逻辑层
+    Reset\MDK-ARM\        -> 启动文件/链接脚本
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ 文件                        │ 职责 & 外设/引脚配置                         │
+├─────────────────────────────────────────────────────────────────────────────┤
+│ main.c                      │ 系统入口, __enable_irq(), HAL_Init(),       │
+│ (Core\Src\)                 │ SystemClock_Config(), 外设初始化, 主循环     │
+│                             │ 调用 App_bootloader_init() + 循环            │
+│                             │ App_bootlaoder_work()                        │
+│                             │ 点亮LED: PF6=LOW (红灯亮表示程序运行中)      │
+│                             │ 时钟: HSE=25MHz, PLL: M=25,N=144,P=2,Q=4   │
+│                             │       => SYSCLK=72MHz, AHB=/1, APB1=/2,     │
+│                             │       APB2=/1, Flash等待=2                   │
+│                             │ 无引脚配置(委托给各MspInit)                   │
+├─────────────────────────────────────────────────────────────────────────────┤
+│ main.h                      │ 引脚宏定义:                                  │
+│ (Core\Inc\)                 │ KEY1_Pin       = GPIO_PIN_13                 │
+│                             │ KEY1_GPIO_Port = GPIOC                       │
+│                             │ KEY1_EXTI_IRQn = EXTI15_10_IRQn              │
+│                             │ W25128QCS_Pin  = GPIO_PIN_6                  │
+│                             │ W25128QCS_GPIO_Port = GPIOG                  │
+├─────────────────────────────────────────────────────────────────────────────┤
+│ gpio.c                      │ MX_GPIO_Init(): 配置所有GPIO                 │
+│ (Core\Src\)                 │                                              │
+│                             │ PC13(KEY1) 上升沿外部中断 下拉 无速度设置    │
+│                             │   EXTI15_10_IRQn 优先级(4,0)                 │
+│                             │                                              │
+│                             │ PF6(LED红灯) 推挽输出 无上下拉 低速          │
+│                             │   初始电平: LOW(亮)                          │
+│                             │                                              │
+│                             │ PG6(W25Q128 CS) 推挽输出 无上下拉 高速       │
+│                             │   初始电平: HIGH(片选无效)                   │
+│                             │                                              │
+│                             │ 使能时钟: GPIOA/B/C/F/G/H                   │
+├─────────────────────────────────────────────────────────────────────────────┤
+│ usart.c                     │ USART1: 115200/8N1/收发                      │
+│ (Core\Src\)                 │ PA9(TX)  AF7 推挽复用 无上下拉 极高速        │
+│                             │ PA10(RX) AF7 推挽复用 无上下拉 极高速        │
+│                             │ 16倍过采样, 无硬件流控                       │
+│                             │ USART1_IRQn 优先级(5,0)                      │
+│                             │ printf重映射: fputc() -> HAL_UART_Transmit() │
+├─────────────────────────────────────────────────────────────────────────────┤
+│ spi.c                       │ SPI1 Master: CPOL=0,CPHA=0(Mode0)           │
+│ (Core\Src\)                 │ 8bit, MSB优先, 软件NSS, 分频8               │
+│                             │ SYSCLK=72MHz, APB2=/1 => SPI1CLK=72MHz      │
+│                             │ 分频8 => SCK=9MHz                           │
+│                             │ PB3(SCK)  AF5 推挽复用 无上下拉 极高速       │
+│                             │ PB4(MISO) AF5 推挽复用 无上下拉 极高速       │
+│                             │ PB5(MOSI) AF5 推挽复用 无上下拉 极高速       │
+│                             │ 注意: 本模块初始化了SPI1但代码中未直接使用   │
+│                             │ (W25Q128驱动不在本工程interface中)            │
+├─────────────────────────────────────────────────────────────────────────────┤
+│ i2c.c                       │ I2C1: 100kHz标准模式, 7位地址                │
+│ (Core\Src\)                 │ DutyCycle=2, 无双地址, 无广播, 允许时钟拉伸  │
+│                             │ PB8(SCL) AF4 开漏复用 无上下拉 极高速        │
+│                             │ PB9(SDA) AF4 开漏复用 无上下拉 极高速        │
+│                             │ 注意: 本模块初始化了I2C1但代码中未直接使用   │
+│                             │ (W24C02驱动不在本工程interface中)             │
+├─────────────────────────────────────────────────────────────────────────────┤
+│ stm32f4xx_it.c              │ 中断服务函数:                                │
+│ (Core\Src\)                 │ - NMI/HardFault/MemManage/BusFault/Usage     │
+│                             │   Fault: 死循环                              │
+│                             │ - SysTick_Handler: HAL_IncTick()             │
+│                             │ - USART1_IRQHandler:                         │
+│                             │   -> HAL_UART_IRQHandler(&huart1)            │
+│                             │ - EXTI15_10_IRQHandler:                      │
+│                             │   -> HAL_GPIO_EXTI_IRQHandler(KEY1_Pin)      │
+├─────────────────────────────────────────────────────────────────────────────┤
+│ stm32f4xx_hal_msp.c         │ HAL_MspInit(): 使能SYSCFG和PWR时钟           │
+│ (Core\Src\)                 │ 无引脚配置(各外设MspInit在各自.c中)          │
+├─────────────────────────────────────────────────────────────────────────────┤
+│ system_stm32f4xx.c          │ SystemInit(): FPU启用 + VTOR重映射           │
+│ (Core\Src\)                 │ USER_VECT_TAB_ADDRESS 已定义                 │
+│                             │ VECT_TAB_OFFSET = 0x00004000                 │
+│                             │ => SCB->VTOR = 0x08004000                    │
+│                             │ HSE_VALUE = 25000000 (25MHz)                 │
+├─────────────────────────────────────────────────────────────────────────────┤
+│ int_bootloader.c            │ 核心底层驱动:                                │
+│ (interface\)                │ - HAL_UARTEx_RxEventCallback(): 中断接收     │
+│                             │   数据+逐字节写Flash (Sector 3)              │
+│                             │ - Int_bootloader_rec_app(): 初始化接收       │
+│                             │ - Int_bootloader_jump_to_app(): 跳转APP      │
+│                             │   校验栈顶+复位向量, 注销外设, 设置MSP/VTOR  │
+│                             │ - Int_bootloader_erase(): 擦除Sector 3       │
+│                             │ 无额外引脚(复用USART1+内置Flash)             │
+├─────────────────────────────────────────────────────────────────────────────┤
+│ int_bootloader.h            │ 宏定义:                                      │
+│ (interface\)                │ BOOTLOADER_UART_RECEIVE_BUFFER_SIZE = 512    │
+│                             │ APP_START_ADDRESS       = 0x0800C000         │
+│                             │ APP_SECTOR3_END_ADDRESS = 0x0800FFFF         │
+│                             │ SRAM_START_ADDRESS      = 0x20000000         │
+│                             │ SRAM_END_ADDRESS        = 0x2001FFFF         │
+├─────────────────────────────────────────────────────────────────────────────┤
+│ App_reset.c                 │ 应用层状态机:                                │
+│ (MDK-ARM\application\)     │ - App_bootloader_init(): 打印启动日志        │
+│                             │ - App_bootloader_run(): 等待"start:len"指令  │
+│                             │ - App_bootloader_rec_data(): 超时判定2秒     │
+│                             │ - App_bootloader_check_data(): 长度校验      │
+│                             │ - App_bootloader_jump_to_app(): 跳转委托     │
+│                             │ - App_bootlaoder_work(): switch主控函数      │
+│                             │ - HAL_GPIO_EXTI_Callback(): 按键确认接收完成 │
+│                             │ 无额外引脚(复用KEY1中断回调)                 │
+├─────────────────────────────────────────────────────────────────────────────┤
+│ App_reset.h                 │ 状态枚举 AppBootloaderState (5态)            │
+│ (MDK-ARM\application\)     │ APP_BOOTLOADER_UART_RECEIVE_BUFFER_SIZE = 64 │
+│                             │ 函数声明                                     │
+├─────────────────────────────────────────────────────────────────────────────┤
+│ startup_stm32f407xx.s       │ 向量表 + Reset_Handler                       │
+│ (MDK-ARM\)                 │ Stack_Size=0x400(1KB), Heap_Size=0x200(512B) │
+│                             │ Reset_Handler: SystemInit() -> __main()      │
+├─────────────────────────────────────────────────────────────────────────────┤
+│ P02_boot_loader.sct         │ Scatter文件:                                 │
+│ (MDK-ARM\P02_boot_loader\) │ LR_IROM1 0x08004000 0x00004000               │
+│                             │ RW_IRAM1 0x20000000 0x0001C000               │
+│                             │ RW_IRAM2 0x2001C000 0x00004000               │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+【引脚配置总表】
+
+  引脚   │ 端口  │ 功能          │ 复用   │ 模式      │ 上下拉 │ 速度   │ 中断配置
+  ────────┼───────┼───────────────┼────────┼───────────┼────────┼────────┼──────────
+  PA9    │ GPIOA │ USART1_TX     │ AF7    │ 推挽复用  │ 无     │ 极高速 │ USART1_IRQn(5,0)
+  PA10   │ GPIOA │ USART1_RX     │ AF7    │ 推挽复用  │ 无     │ 极高速 │ (同上)
+  PB3    │ GPIOB │ SPI1_SCK      │ AF5    │ 推挽复用  │ 无     │ 极高速 │ 无
+  PB4    │ GPIOB │ SPI1_MISO     │ AF5    │ 推挽复用  │ 无     │ 极高速 │ 无
+  PB5    │ GPIOB │ SPI1_MOSI     │ AF5    │ 推挽复用  │ 无     │ 极高速 │ 无
+  PB8    │ GPIOB │ I2C1_SCL      │ AF4    │ 开漏复用  │ 无     │ 极高速 │ 无
+  PB9    │ GPIOB │ I2C1_SDA      │ AF4    │ 开漏复用  │ 无     │ 极高速 │ 无
+  PC13   │ GPIOC │ KEY1(按键)    │ 无     │ 输入EXTI  │ 下拉   │ -      │ EXTI15_10(4,0)上升沿
+  PF6    │ GPIOF │ LED(红灯)     │ 无     │ 推挽输出  │ 无     │ 低速   │ 无
+  PG6    │ GPIOG │ W25Q128 CS    │ 无     │ 推挽输出  │ 无     │ 高速   │ 无
+
+
+================================================================================
+四、完整调用树
+================================================================================
+
+【A. 树状调用图（带注释）】
+
+main()                                           [Core\Src\main.c:65]
+├── __enable_irq()                               ; 主BL跳转前关了中断,这里重开
+├── HAL_Init()                                   ; HAL库初始化, SysTick=1ms
+│   └── HAL_MspInit()                            [Core\Src\stm32f4xx_hal_msp.c]
+│       ├── __HAL_RCC_SYSCFG_CLK_ENABLE()
+│       └── __HAL_RCC_PWR_CLK_ENABLE()
+├── SystemClock_Config()                         [Core\Src\main.c:115]
+│   ├── __HAL_RCC_PWR_CLK_ENABLE()
+│   ├── __HAL_PWR_VOLTAGESCALING_CONFIG(SCALE1)
+│   ├── HAL_RCC_OscConfig()                      ; HSE=25MHz, PLL: M25/N144/P2/Q4
+│   └── HAL_RCC_ClockConfig()                    ; SYSCLK=72MHz, APB1=/2, APB2=/1
+├── MX_GPIO_Init()                               [Core\Src\gpio.c:40]
+│   ├── 使能GPIOA/B/C/F/G/H时钟
+│   ├── PF6输出LOW(红灯亮)
+│   ├── PG6输出HIGH(W25Q128 CS无效)
+│   ├── PC13 EXTI上升沿+下拉
+│   ├── PF6 推挽输出低速
+│   ├── PG6 推挽输出高速
+│   └── EXTI15_10_IRQn 优先级(4,0) 使能
+├── MX_USART1_UART_Init()                        [Core\Src\usart.c:36]
+│   └── HAL_UART_Init(&huart1)
+│       └── HAL_UART_MspInit()                   [Core\Src\usart.c:65]
+│           ├── __HAL_RCC_USART1_CLK_ENABLE()
+│           ├── PA9/PA10 AF7复用推挽极高速
+│           └── USART1_IRQn 优先级(5,0) 使能
+├── MX_I2C1_Init()                               [Core\Src\i2c.c:33]
+│   └── HAL_I2C_Init(&hi2c1)
+│       └── HAL_I2C_MspInit()                    [Core\Src\i2c.c:63]
+│           ├── PB8/PB9 AF4开漏极高速
+│           └── __HAL_RCC_I2C1_CLK_ENABLE()
+├── MX_SPI1_Init()                               [Core\Src\spi.c:35]
+│   └── HAL_SPI_Init(&hspi1)
+│       └── HAL_SPI_MspInit()                    [Core\Src\spi.c:66]
+│           ├── __HAL_RCC_SPI1_CLK_ENABLE()
+│           └── PB3/4/5 AF5推挽极高速
+├── App_bootloader_init()                        [application\App_reset.c:42]
+│   └── printf("reset_App started\r\n")
+│       └── fputc() -> HAL_UART_Transmit()       [Core\Src\usart.c:119]
+├── HAL_GPIO_WritePin(PF6, LOW)                  ; 红灯亮
+│
+└── while(1)  ─ 主循环 ─────────────────────────────────────────
+    └── App_bootlaoder_work()                    [application\App_reset.c:148]
+        ├── [INIT态] App_bootloader_run()        [application\App_reset.c:55]
+        │   ├── HAL_UARTEx_ReceiveToIdle()       ; 阻塞等待"start:len"
+        │   ├── strstr("start:")                 ; 解析命令
+        │   ├── atoi() 提取长度                  ; 设 app_total_length
+        │   └── 状态 -> RUN
+        │
+        ├── [RUN态]
+        │   ├── Int_bootloader_erase()           [interface\int_bootloader.c:118]
+        │   │   ├── HAL_FLASH_Unlock()
+        │   │   ├── HAL_FLASHEx_Erase(Sector3)  ; 擦除 0x0800C000~0x0800FFFF
+        │   │   └── HAL_FLASH_Lock()
+        │   ├── printf("Flash erased\r\n")
+        │   ├── uart_tx_complete_flag = 0        ; 清按键标志
+        │   ├── Int_bootloader_rec_app()         [interface\int_bootloader.c:73]
+        │   │   ├── flash_write_offset = 0
+        │   │   ├── total_length = 0
+        │   │   ├── __HAL_UART_CLEAR_OREFLAG()
+        │   │   ├── __HAL_UART_CLEAR_IDLEFLAG()
+        │   │   └── HAL_UARTEx_ReceiveToIdle_IT(); 启动中断接收
+        │   └── 状态 -> REC_DATA
+        │
+        ├── [REC_DATA态] App_bootloader_rec_data() [application\App_reset.c:96]
+        │   └── if total_length!=0 && (Tick-last_receive_time)>2000
+        │       └── 状态 -> CHECK_DATA           ; 2秒无数据=接收完成
+        │
+        ├── [CHECK_DATA态] App_bootloader_check_data() [application\App_reset.c:109]
+        │   ├── 比较 app_total_length == total_length
+        │   ├── [匹配] 状态 -> JUMP_TO_APP
+        │   └── [不匹配] NVIC_SystemReset()      ; 复位重来
+        │
+        └── [JUMP_TO_APP态] App_bootloader_jump_to_app() [application\App_reset.c:130]
+            └── Int_bootloader_jump_to_app()     [interface\int_bootloader.c:88]
+                ├── 读取 *0x0800C000 -> app_stack_pointer
+                ├── 读取 *0x0800C004 -> app_reset_handler
+                ├── 校验栈顶 in [0x20000000, 0x2001FFFF]
+                ├── 校验复位向量 in [0x0800C000, 0x0800FFFF]
+                ├── NVIC_DisableIRQ(EXTI15_10_IRQn)
+                ├── NVIC_DisableIRQ(USART1_IRQn)
+                ├── SysTick停止
+                ├── HAL_DeInit()
+                ├── __disable_irq()
+                ├── __set_MSP(app_stack_pointer)
+                ├── SCB->VTOR = 0x0800C000
+                └── app_entry()                  ; 跳转到APP!
+
+
+【B. 并行中断入口关系（箭头简图）】
+
+  USART1_IRQHandler()       [stm32f4xx_it.c:207]
+    -> HAL_UART_IRQHandler(&huart1)              [HAL库内部]
+       -> HAL_UARTEx_RxEventCallback()           [int_bootloader.c:19]
+          (接收数据+写Flash)
+
+  EXTI15_10_IRQHandler()    [stm32f4xx_it.c:221]
+    -> HAL_GPIO_EXTI_IRQHandler(KEY1_Pin)        [HAL库内部]
+       -> HAL_GPIO_EXTI_Callback(GPIO_PIN_13)    [App_reset.c:27]
+          (设置 uart_tx_complete_flag=1)
+
+  SysTick_Handler()         [stm32f4xx_it.c:185]
+    -> HAL_IncTick()                             [HAL库内部]
+       (维护HAL_GetTick()时基)
+
+
+================================================================================
+五、流程图（核心流转）
+================================================================================
+
+【主流程图 - 成功路径 + 失败路径】
+
+  ┌─────────────────────────────┐
+  │     上电 / 被 BL 跳转      │
+  │  (从 Sector 0 跳到这里)    │
+  └──────────────┬──────────────┘
+                 v
+  ┌─────────────────────────────┐
+  │ __enable_irq()              │  <-- BL跳转前关了中断
+  │ HAL_Init()                  │
+  │ SystemClock_Config()        │  HSE 25MHz -> PLL -> 72MHz
+  │ MX_GPIO/USART/I2C/SPI_Init │
+  │ App_bootloader_init()       │  打印欢迎信息
+  │ PF6=LOW (红灯亮)           │
+  └──────────────┬──────────────┘
+                 v
+  ┌─────────────────────────────┐
+  │ [INIT态] 阻塞等待串口数据  │
+  │ 等待用户发送 "start:len"   │ <────────────────────┐
+  └──────────────┬──────────────┘                      │
+                 │ 收到有效指令                        │
+                 v                                     │
+  ┌─────────────────────────────┐                      │
+  │ [RUN态]                     │                      │
+  │ 1. Int_bootloader_erase()   │  擦除Sector3         │
+  │ 2. 清按键标志               │                      │
+  │ 3. Int_bootloader_rec_app() │  启动中断接收        │
+  └──────────────┬──────────────┘                      │
+                 v                                     │
+  ┌─────────────────────────────┐                      │
+  │ [REC_DATA态] 等待接收完成   │                      │
+  │                             │                      │
+  │ 中断回调持续写Flash:        │                      │
+  │ USART1_IRQ -> RxEvent回调   │                      │
+  │ -> HAL_FLASH_Program(BYTE)  │                      │
+  │                             │                      │
+  │ 超时判定: 2秒无新数据       │                      │
+  │ = 接收完成                  │                      │
+  └──────────┬──────────────────┘                      │
+             │ 超时触发                                │
+             v                                         │
+  ┌─────────────────────────────┐                      │
+  │ [CHECK_DATA态] 长度校验     │                      │
+  │ app_total_length ==         │                      │
+  │ total_length ?              │                      │
+  └──────┬──────────────┬───────┘                      │
+         │ YES          │ NO                           │
+         v              v                              │
+  ┌──────────┐   ┌──────────────┐                      │
+  │ 校验通过 │   │ 打印错误信息 │                      │
+  └────┬─────┘   │ NVIC_System  │                      │
+       │         │ Reset()      │ ----> 全芯片复位 ----┘
+       v         └──────────────┘
+  ┌─────────────────────────────┐
+  │ [JUMP_TO_APP态]             │
+  │ 1. 读Sector3栈顶+复位向量  │
+  │ 2. 校验地址合法性           │──── 失败 ──> NVIC_SystemReset()
+  │ 3. 禁用EXTI/USART中断      │
+  │ 4. 停SysTick               │
+  │ 5. HAL_DeInit()             │
+  │ 6. __disable_irq()         │
+  │ 7. __set_MSP(栈顶)         │
+  │ 8. SCB->VTOR = 0x0800C000  │
+  │ 9. 跳转到复位向量          │
+  └──────────────┬──────────────┘
+                 v
+  ┌─────────────────────────────┐
+  │ 用户 APP 开始执行           │
+  │ (Sector 3: 0x0800C000)     │
+  └─────────────────────────────┘
+
+
+【中断处理并行通道】(在 REC_DATA 态期间活跃)
+
+  主循环(轮询)                  中断通道1               中断通道2
+  ─────────────                 ──────────              ──────────
+  App_bootloader_rec_data()     USART1_IRQHandler()     EXTI15_10_IRQHandler()
+  │                             │                       │
+  │ 检查超时                    │ HAL_UART_IRQHandler   │ HAL_GPIO_EXTI_IRQHandler
+  │ (2s无数据?)                 │   │                   │   │
+  │                             │   v                   │   v
+  │                             │ RxEventCallback()     │ EXTI_Callback()
+  │                             │  -> 写Flash           │  -> uart_tx_complete_flag=1
+  │                             │  -> 更新total_length  │     (当前代码未在状态机
+  │                             │  -> 重启中断接收      │      中使用此标志)
+  v                             v                       v
+
+  注意: uart_tx_complete_flag 在代码中被设置但未被状态机读取,
+        当前实际判定接收完成靠的是 2秒超时机制。
+
+
+================================================================================
+六、状态机/枚举值/宏定义速查表
+================================================================================
+
+【状态机枚举】(App_reset.h)
+
+  typedef enum {
+      APP_BOOTLOADER_STATE_INIT       = 0,  // 等待用户输入"start:len"
+      APP_BOOTLOADER_STATE_RUN        = 1,  // 擦Flash+启动中断接收
+      APP_BOOTLOADER_STATE_REC_DATA   = 2,  // 等待接收完成(2s超时)
+      APP_BOOTLOADER_STATE_CHECK_DATA = 3,  // 校验数据长度
+      APP_BOOTLOADER_STATE_JUMP_TO_APP= 4,  // 跳转到APP
+  } AppBootloaderState;
+
+  状态流转:
+  INIT --[收到"start:len"]--> RUN --[擦除+启动接收]--> REC_DATA
+  REC_DATA --[2s超时]--> CHECK_DATA
+  CHECK_DATA --[长度匹配]--> JUMP_TO_APP --[跳转成功]--> (永不返回)
+  CHECK_DATA --[长度不匹配]--> NVIC_SystemReset() --> (重新上电)
+  JUMP_TO_APP --[跳转失败]--> NVIC_SystemReset() --> (重新上电)
+
+【宏定义速查表】
+
+  宏名                                   │ 值          │ 文件              │ 说明
+  ───────────────────────────────────────┼─────────────┼───────────────────┼────────────────
+  APP_BOOTLOADER_UART_RECEIVE_BUFFER_SIZE│ 64          │ App_reset.h       │ start指令接收缓冲
+  BOOTLOADER_UART_RECEIVE_BUFFER_SIZE    │ 512         │ int_bootloader.h  │ 固件数据接收缓冲
+  APP_START_ADDRESS                      │ 0x0800C000  │ int_bootloader.h  │ APP写入起始地址
+  APP_SECTOR3_END_ADDRESS                │ 0x0800FFFF  │ int_bootloader.h  │ Sector3结束地址
+  SRAM_START_ADDRESS                     │ 0x20000000  │ int_bootloader.h  │ SRAM起始(校验用)
+  SRAM_END_ADDRESS                       │ 0x2001FFFF  │ int_bootloader.h  │ SRAM结束(校验用)
+  KEY1_Pin                               │ GPIO_PIN_13 │ main.h            │ 按键引脚
+  KEY1_GPIO_Port                         │ GPIOC       │ main.h            │ 按键端口
+  KEY1_EXTI_IRQn                         │ EXTI15_10   │ main.h            │ 按键中断号
+  W25128QCS_Pin                          │ GPIO_PIN_6  │ main.h            │ W25Q128片选
+  W25128QCS_GPIO_Port                    │ GPIOG       │ main.h            │ W25Q128片选端口
+  USER_VECT_TAB_ADDRESS                  │ (defined)   │ system_stm32f4xx.c│ 启用VTOR重映射
+  VECT_TAB_OFFSET                        │ 0x00004000  │ system_stm32f4xx.c│ 向量表偏移
+  HSE_VALUE                              │ 25000000    │ system_stm32f4xx.c│ 外部晶振25MHz
+  Stack_Size                             │ 0x400       │ startup.s         │ 栈大小1KB
+  Heap_Size                              │ 0x200       │ startup.s         │ 堆大小512B
+
+【Flash编程相关常量】(HAL库定义)
+
+  FLASH_TYPEPROGRAM_BYTE                 ; 逐字节编程模式
+  FLASH_TYPEERASE_SECTORS               ; 按扇区擦除模式
+  FLASH_SECTOR_3                         ; 目标扇区编号
+  FLASH_VOLTAGE_RANGE_3                  ; 2.7~3.6V 电压范围
+
+
+================================================================================
+七、关键全局变量总览
+================================================================================
+
+  变量名                  | 所在文件           | 类型      | 作用                    | 谁写它                    | 谁读它
+  ────────────────────────┼────────────────────┼───────────┼─────────────────────────┼───────────────────────────┼──────────────────────
+  app_bootloader_state    | App_reset.c        | AppBoot-  | 主状态机当前状态        | App_bootloader_run()      | App_bootlaoder_work()
+                          |                    | loaderSt. |                         | App_bootloader_rec_data() |
+                          |                    |           |                         | App_bootloader_check_data |
+                          |                    |           |                         | App_bootloader_init()     |
+  ────────────────────────┼────────────────────┼───────────┼─────────────────────────┼───────────────────────────┼──────────────────────
+  app_rec_start_buffer[]  | App_reset.c        | uint8_t   | "start:len"指令接收缓冲 | HAL_UARTEx_ReceiveToIdle  | App_bootloader_run()
+                          |                    | [64]      | (阻塞接收用)            | (HAL库写入)               | (strstr解析)
+  ────────────────────────┼────────────────────┼───────────┼─────────────────────────┼───────────────────────────┼──────────────────────
+  app_rec_start_length    | App_reset.c        | uint16_t  | 本次阻塞接收字节数      | HAL_UARTEx_ReceiveToIdle  | App_bootloader_run()
+  ────────────────────────┼────────────────────┼───────────┼─────────────────────────┼───────────────────────────┼──────────────────────
+  app_total_length        | App_reset.c        | uint16_t  | 用户声明的固件总长度     | App_bootloader_run()      | App_bootloader_check_
+                          |                    |           |                         | (从"start:len"解析)       | data()
+  ────────────────────────┼────────────────────┼───────────┼─────────────────────────┼───────────────────────────┼──────────────────────
+  uart_tx_complete_flag   | App_reset.c        | volatile  | 按键确认标志(KEY1)       | HAL_GPIO_EXTI_Callback()  | (当前未被状态机读取)
+                          |                    | uint8_t   | (设计意图:手动确认接收)  | App_bootlaoder_work()=0   | ★ 见注意事项
+  ────────────────────────┼────────────────────┼───────────┼─────────────────────────┼───────────────────────────┼──────────────────────
+  receive_buffer[]        | int_bootloader.c   | uint8_t   | 中断接收固件数据缓冲    | USART1 RxEvent回调        | RxEventCallback()
+                          |                    | [512]     |                         | (HAL库写入)               | (写Flash后memset清0)
+  ────────────────────────┼────────────────────┼───────────┼─────────────────────────┼───────────────────────────┼──────────────────────
+  receive_length          | int_bootloader.c   | uint16_t  | 单次中断接收字节数      | RxEventCallback()         | RxEventCallback()
+  ────────────────────────┼────────────────────┼───────────┼─────────────────────────┼───────────────────────────┼──────────────────────
+  total_length            | int_bootloader.c   | uint16_t  | 累计接收总字节数        | RxEventCallback()累加     | App_bootloader_rec_
+                          |                    |           |                         | Int_bootloader_rec_app=0  | data()
+                          |                    |           |                         |                           | App_bootloader_check_
+                          |                    |           |                         |                           | data()
+  ────────────────────────┼────────────────────┼───────────┼─────────────────────────┼───────────────────────────┼──────────────────────
+  flash_write_offset      | int_bootloader.c   | uint32_t  | Flash写入偏移量         | RxEventCallback()累加     | RxEventCallback()
+                          |                    |           | (APP_START_ADDRESS+off) | Int_bootloader_rec_app=0  | (计算写入地址)
+  ────────────────────────┼────────────────────┼───────────┼─────────────────────────┼───────────────────────────┼──────────────────────
+  last_receive_time       | int_bootloader.c   | uint32_t  | 上次收到数据的时间戳    | RxEventCallback()         | App_bootloader_rec_
+                          |                    |           | (HAL_GetTick()毫秒)     | App_bootlaoder_work()     | data() (2s超时判断)
+  ────────────────────────┼────────────────────┼───────────┼─────────────────────────┼───────────────────────────┼──────────────────────
+  huart1                  | usart.c            | UART_     | USART1句柄              | MX_USART1_UART_Init()     | 几乎所有串口操作
+                          |                    | HandleTyp |                         |                           |
+  ────────────────────────┼────────────────────┼───────────┼─────────────────────────┼───────────────────────────┼──────────────────────
+  hspi1                   | spi.c              | SPI_      | SPI1句柄                | MX_SPI1_Init()            | (本模块未直接使用)
+                          |                    | HandleTyp |                         |                           |
+  ────────────────────────┼────────────────────┼───────────┼─────────────────────────┼───────────────────────────┼──────────────────────
+  hi2c1                   | i2c.c              | I2C_      | I2C1句柄                | MX_I2C1_Init()            | (本模块未直接使用)
+                          |                    | HandleTyp |                         |                           |
+
+  ★ 注意: uart_tx_complete_flag 在EXTI回调中被置1, 在RUN态进入前被清0,
+    但在 REC_DATA 态中并未被检查。当前接收完成仅靠 2秒超时 判定。
+    推测此标志为预留功能或早期设计残留, 可考虑后续整合到接收完成判定中。
+
+
+================================================================================
+八、实际使用步骤
+================================================================================
+
+【最小可跑通步骤】
+
+  1) 硬件连接要求
+     ─────────────────────────────────────────────────────────
+     │ 信号       │ MCU引脚 │ 外部连接                       │
+     ├────────────┼─────────┼────────────────────────────────┤
+     │ USART1_TX  │ PA9     │ USB转TTL模块 RX                │
+     │ USART1_RX  │ PA10    │ USB转TTL模块 TX                │
+     │ GND        │ GND     │ USB转TTL模块 GND               │
+     │ KEY1       │ PC13    │ 板载按键(上升沿触发,外部下拉)  │
+     │ LED红灯    │ PF6     │ 板载LED(低电平亮)              │
+     │ SWD        │ PA13/14 │ ST-Link/J-Link调试器           │
+     └────────────┴─────────┴────────────────────────────────┘
+     注: SPI1(PB3/4/5)+I2C1(PB8/9)已初始化但本模块未使用,
+         如板上有W25Q128/W24C02可保持接线,不影响功能。
+
+  2) 编译下载
+     a. Keil MDK 打开 P03_bootloader_reset.uvprojx
+     b. 确认 Target -> Flash Download 起始地址: 0x08004000, 大小: 0x4000
+        (与Scatter文件一致)
+     c. 编译(F7), 下载(F8)
+     d. 注意: 先烧写P02 Bootloader到Sector 0, 本程序需要由BL跳转激活
+        或者直接用调试器将本程序烧到0x08004000并手动设置PC
+
+  3) 串口/调试器参数
+     │ 参数       │ 值                               │
+     ├────────────┼──────────────────────────────────┤
+     │ 波特率     │ 115200                           │
+     │ 数据位     │ 8                                │
+     │ 停止位     │ 1                                │
+     │ 校验位     │ 无(None)                         │
+     │ 流控       │ 无(None)                         │
+     │ 编码       │ ASCII / UTF-8                    │
+     │ 发送换行   │ \r\n (CRLF)                      │
+     └────────────┴──────────────────────────────────┘
+
+  4) 触发操作
+     步骤1: BL跳转或上电后, 串口显示:
+            "reset_App started"
+            "Waiting for data..."
+            "Please send 'start:len' to start"
+
+     步骤2: 在串口工具中发送(文本模式):
+            start:1024
+            (假设你要发送的固件bin文件大小为1024字节)
+
+     步骤3: 串口显示:
+            "Start command received, expected data length: 1024 bytes"
+            "Flash erased"
+            "Start receiving data..."
+
+     步骤4: 切换串口工具为"发送文件"模式,选择编译好的APP的bin文件发送
+            (文件大小必须与步骤2声明的一致)
+
+     步骤5: 发送完毕后等待2秒(超时判定),串口显示:
+            "Data received successfully, total length: 1024 bytes"
+            然后程序自动跳转到APP执行
+
+  5) 预期输出/现象
+     - PF6红灯常亮 = Reset程序正在运行
+     - 串口持续有日志输出
+     - 发送固件后2秒, 如果长度匹配, 自动跳转到APP
+     - 跳转成功后红灯行为取决于APP代码
+
+  6) 验证方法
+     a. 用串口监视器观察全程日志
+     b. 跳转成功的标志: 不再收到Reset程序的日志, APP开始运行
+     c. 用调试器读取 0x0800C000~0x0800FFFF 验证Flash内容与bin文件一致
+     d. 可用 J-Link Commander 的 "mem32 0x0800C000 4" 读取头部4字(栈顶+复位向量)
+
+【常见失败现象与排查入口】
+
+  现象                        │ 可能原因                       │ 排查方法
+  ────────────────────────────┼────────────────────────────────┼──────────────────────────
+  无任何串口输出              │ 1.VTOR未重映射(0x08004000)     │ 检查system_stm32f4xx.c
+                              │ 2.BL未正确跳转                 │ 检查BL的跳转地址
+                              │ 3.串口接线错误TX/RX反接        │ 交换TX/RX线
+                              │ 4.波特率不匹配                 │ 确认115200
+  ────────────────────────────┼────────────────────────────────┼──────────────────────────
+  显示欢迎信息后无反应        │ 阻塞在ReceiveToIdle等待       │ 正常!等待你发送"start:len"
+  ────────────────────────────┼────────────────────────────────┼──────────────────────────
+  "Invalid format"            │ 指令格式错误                   │ 确认发送"start:1024"无空格
+                              │ 没有"start:"前缀              │ 注意冒号是英文半角
+  ────────────────────────────┼────────────────────────────────┼──────────────────────────
+  "Invalid data length"       │ atoi()解析长度为0              │ 检查冒号后的数字
+  ────────────────────────────┼────────────────────────────────┼──────────────────────────
+  "Flash erase failed"        │ Flash解锁或擦除失败           │ 检查VoltageRange配置
+                              │                                │ 确认供电电压>2.7V
+  ────────────────────────────┼────────────────────────────────┼──────────────────────────
+  "Flash write failed"        │ 写Flash失败                   │ 1.检查是否先解锁
+                              │                                │ 2.确认地址在Sector3范围
+                              │                                │ 3.检查是否先擦除
+  ────────────────────────────┼────────────────────────────────┼──────────────────────────
+  "Flash overflow"            │ 数据超过Sector3的16KB         │ 减小固件大小或改用更大扇区
+  ────────────────────────────┼────────────────────────────────┼──────────────────────────
+  "Length mismatch"后重启     │ 实际接收长度!=声明长度        │ 1.检查bin文件实际大小
+                              │                                │ 2.确认start:后数字正确
+                              │                                │ 3.串口工具发送设置检查
+  ────────────────────────────┼────────────────────────────────┼──────────────────────────
+  "Invalid application stack  │ APP栈顶不在SRAM范围           │ 1.确认APP SCT的RW段在
+  pointer"                    │ (0x20000000~0x2001FFFF)       │   SRAM范围内
+                              │                                │ 2.APP可能未正确编译
+  ────────────────────────────┼────────────────────────────────┼──────────────────────────
+  "Invalid app_reset_handler" │ APP复位向量不在Sector3        │ 确认APP SCT起始=0x0800C000
+  ────────────────────────────┼────────────────────────────────┼──────────────────────────
+  跳转后HardFault             │ 1.APP未设置VTOR               │ APP需设VTOR=0x0800C000
+                              │ 2.APP使用了未__enable_irq的中断│ APP入口需__enable_irq()
+                              │ 3.时钟配置冲突                │ APP需重新配时钟
+
+
+================================================================================
+九、芯片相关的编程要点备忘
+================================================================================
+
+【1. 时钟树与分频关系】
+
+  HSE(25MHz) -> PLL -> SYSCLK
+  PLL配置: PLLM=25, PLLN=144, PLLP=2, PLLQ=4
+  
+  计算:
+    VCO输入  = HSE / PLLM = 25MHz / 25 = 1MHz
+    VCO输出  = VCO输入 * PLLN = 1MHz * 144 = 144MHz
+    SYSCLK   = VCO输出 / PLLP = 144MHz / 2 = 72MHz
+    PLL48CLK = VCO输出 / PLLQ = 144MHz / 4 = 36MHz (USB不可用,需48MHz)
+
+  总线时钟:
+    AHB  = SYSCLK / 1 = 72MHz  (HCLK)
+    APB1 = HCLK / 2   = 36MHz  (定时器x2=72MHz)
+    APB2 = HCLK / 1   = 72MHz  (定时器=72MHz)
+
+  外设实际时钟:
+    USART1 (APB2) = 72MHz -> 波特率115200
+    SPI1   (APB2) = 72MHz / 8 = 9MHz SCK
+    I2C1   (APB1) = 36MHz -> SCL 100kHz标准模式
+
+  Flash等待周期: FLASH_LATENCY_2 (2个等待周期, 适用于60<HCLK<=90MHz)
+
+  注: STM32F407最高主频168MHz, 本工程仅用72MHz, 性能有余量。
+
+【2. 中断优先级分组与抢占关系】
+
+  HAL_Init()中默认设置: NVIC_PriorityGroup_4 (4位抢占, 0位子优先级)
+  
+  中断优先级分配(抢占优先级, 子优先级):
+  │ 中断源          │ 抢占 │ 子 │ 说明                           │
+  ├─────────────────┼──────┼────┼────────────────────────────────┤
+  │ SysTick         │ 15   │ 0  │ 最低优先级(HAL默认)            │
+  │ EXTI15_10(KEY1) │ 4    │ 0  │ 按键中断, 较高优先级           │
+  │ USART1          │ 5    │ 0  │ 串口中断, 次于按键             │
+  └─────────────────┴──────┴────┴────────────────────────────────┘
+
+  分析: KEY1(4) 可以抢占 USART1(5), 这意味着在串口接收数据过程中,
+        按下按键可以立即响应。设计合理。
+
+【3. DMA通道分配】
+
+  本模块未使用DMA。所有数据传输使用:
+  - 阻塞轮询: HAL_UARTEx_ReceiveToIdle() 用于初始指令接收
+  - 中断方式: HAL_UARTEx_ReceiveToIdle_IT() 用于固件数据接收
+  - 阻塞发送: HAL_UART_Transmit() 通过printf/fputc
+
+【4. 外设初始化顺序依赖】
+
+  必须遵守的初始化顺序:
+  1. __enable_irq()        -- BL跳转后中断是关闭的,必须先开
+  2. HAL_Init()            -- 初始化SysTick(后续所有HAL_Delay/超时依赖它)
+  3. SystemClock_Config()  -- PLL配置,后续外设时钟依赖此步
+  4. MX_GPIO_Init()        -- GPIO时钟+引脚配置(EXTI也在此步)
+  5. MX_USART1_UART_Init() -- 串口(依赖GPIO时钟已开)
+  6. MX_I2C1_Init()        -- I2C(依赖GPIO时钟已开)
+  7. MX_SPI1_Init()        -- SPI(依赖GPIO时钟已开)
+
+  关键: __enable_irq()必须在最前面, 否则HAL_Init()中的SysTick无法工作,
+        导致HAL_Delay()死锁。
+
+【5. 引脚复用冲突检查】
+
+  已检查本工程所有引脚, 无冲突:
+  │ 引脚 │ 功能1     │ 功能2 │ 冲突? │
+  ├──────┼───────────┼───────┼───────┤
+  │ PA9  │ USART1_TX │ -     │ 无    │
+  │ PA10 │ USART1_RX │ -     │ 无    │
+  │ PB3  │ SPI1_SCK  │ JTDO  │ ★    │
+  │ PB4  │ SPI1_MISO │ JTRST │ ★    │
+  │ PB5  │ SPI1_MOSI │ -     │ 无    │
+  │ PB8  │ I2C1_SCL  │ -     │ 无    │
+  │ PB9  │ I2C1_SDA  │ -     │ 无    │
+  │ PC13 │ KEY1 EXTI │ -     │ 无    │
+  │ PF6  │ LED输出   │ -     │ 无    │
+  │ PG6  │ W25Q CS   │ -     │ 无    │
+  └──────┴───────────┴───────┴───────┘
+
+  ★ PB3/PB4 注意: 这两个引脚默认是 JTAG 功能(JTDO/JTRST)。
+     CubeMX 配置为 SPI1 复用后会自动释放 JTAG 功能。
+     如果使用完整JTAG调试(而非SWD), 会产生冲突。
+     本工程使用 SWD (PA13/PA14) 调试, 所以无实际冲突。
+
+【6. Flash/EEPROM擦写注意事项】
+
+  a) 擦写前必须调用 HAL_FLASH_Unlock(), 完成后 HAL_FLASH_Lock()
+  b) 擦除操作按扇区进行, Sector 3 = 16KB, 擦除时间约100-400ms
+  c) 擦除期间CPU阻塞(内置Flash单Bank), 中断服务中不能访问Flash
+     -> 本工程在擦除前已完成中断接收启动, 擦除在主循环RUN态执行,
+        此时尚未有UART数据到来, 不会冲突
+  d) FLASH_TYPEPROGRAM_BYTE 逐字节编程, 每字节编程时间约16us
+     -> 对于512字节缓冲区, 单次回调写入耗时约8ms
+  e) FLASH_VOLTAGE_RANGE_3 对应2.7~3.6V, 支持字节/半字/字/双字编程
+  f) 写入地址必须对齐(字节模式可1字节对齐, 已满足)
+  g) Flash只能从1变0, 不能从0变1, 所以必须先擦除再写入
+
+  ★ 本模块不做CRC校验, 仅做长度校验。CRC校验在其他分区/模块完成。
+
+【7. 通信时序要求】
+
+  UART接收协议:
+  - 第一阶段(INIT态): 阻塞接收, 等待"start:len\r\n"
+    使用 HAL_UARTEx_ReceiveToIdle(), 超时=HAL_MAX_DELAY(永久等待)
+    触发条件: 缓冲区满(64B) 或 空闲帧检测(IDLE)
+
+  - 第二阶段(REC_DATA态): 中断接收
+    使用 HAL_UARTEx_ReceiveToIdle_IT(), 缓冲区512B
+    每次收到数据(空闲帧触发)立即写Flash
+    完成判定: 2秒无新数据
+
+  时序约束:
+  - 串口工具发送文件时, 两包间隔不能超过2秒, 否则会被误判为接收完成
+  - 115200bps下, 512字节约需45ms传输, 远小于2秒阈值
+  - 但如果串口工具逐字节发送且有大间隔, 可能触发误判
+
+【8. 低功耗相关】
+
+  本模块未使用任何低功耗模式。
+  - 主循环中使用 while(1) 忙等
+  - INIT态阻塞在 HAL_UARTEx_ReceiveToIdle() (CPU仍运行, 非WFI)
+  - 作为Bootloader/恢复程序, 低功耗非设计目标
+
+
+================================================================================
+十、改动总结
+================================================================================
+
+本文档基于源码分析生成, 已对以下源码做修正:
+  [1] int_bootloader.c: NVIC_DisableIRQ(EXTI9_5_IRQn) -> EXTI15_10_IRQn (2026-04-12)
+
+以下是分析过程中发现的关键事实与潜在问题:
+
+【核心发现】
+
+  1. 本模块(P03 Reset)定位为"出厂重置/恢复程序", 烧写在Sector 1(0x08004000),
+     由主Bootloader(P02, Sector 0)在APP损坏或用户触发恢复时跳转执行。
+
+  2. 核心功能为5态状态机: 等待指令->擦Flash->中断接收写Flash->长度校验->跳转APP。
+     接收完成判定使用2秒超时机制。
+
+  3. 系统时钟72MHz(非F407最高的168MHz), PLL配置: HSE25/M25/N144/P2 = 72MHz。
+
+  4. VTOR = 0x08004000 配置正确, 与Scatter文件和实际烧写地址一致。
+
+  5. 跳转到APP前做了完整的注销流程: 禁中断->停SysTick->HAL_DeInit->
+     设MSP->设VTOR->跳转。
+
+【潜在问题与注意事项】
+
+  ★ 问题1: uart_tx_complete_flag 未使用
+    - HAL_GPIO_EXTI_Callback()设置此标志=1, RUN态进入前清0
+    - 但 REC_DATA 态中从未检查此标志
+    - 当前接收完成完全依赖2秒超时, 按键无实际作用
+    - 建议: 在 App_bootloader_rec_data() 中增加对此标志的检查,
+      实现"按键手动确认接收完成"功能
+
+  ★ 问题2: SPI1/I2C1 初始化但未使用
+    - main.c 中调用了 MX_I2C1_Init() 和 MX_SPI1_Init()
+    - 但 interface 目录下没有 W25Q128/W24C02 驱动文件
+    - 这些外设在本模块中无实际功能, 仅占用引脚和少量初始化时间
+    - 原因推测: CubeMX工程与P02共用IOC配置, 统一初始化
+
+  ★ 问题3: [已修复] 跳转前 NVIC_DisableIRQ 中断号已更正
+    - int_bootloader.c: NVIC_DisableIRQ(EXTI9_5_IRQn) -> EXTI15_10_IRQn
+    - KEY1(PC13) 使用 EXTI15_10_IRQn, 现已正确禁用
+    - 修复日期: 2026-04-12
+
+  ★ 问题4: app_total_length 类型为 uint16_t (最大65535)
+    - Sector 3 大小为 16KB = 16384 字节, uint16_t 足够
+    - 但如果将来扩展到更大扇区, 需改为 uint32_t
+
+  ★ 问题5: Flash写入期间中断执行
+    - RxEventCallback 中先 HAL_FLASH_Unlock(), 写入后 HAL_FLASH_Lock()
+    - 写入在中断上下文中执行(USART1_IRQn 优先级5)
+    - 更高优先级的中断(如KEY1, 优先级4)可在写入过程中打断
+    - 但KEY1回调仅设标志, 不访问Flash, 无实际冲突
+
+【配置一致性检查结果】
+
+  检查项                        状态     说明
+  ─────────────────────────────────────────────────────
+  Scatter起始地址 vs VTOR       一致     均为0x08004000
+  APP写入地址 vs Sector3范围    一致     0x0800C000~0x0800FFFF
+  SRAM校验范围 vs F407规格      一致     0x20000000~0x2001FFFF(128KB)
+  波特率配置 vs 代码使用        一致     115200/8N1
+  中断优先级分组(Group4)       正确     4位抢占/0位子优先级
+  GPIO时钟使能 vs 引脚使用      一致     A/B/C/F/G/H均已使能
+  PLL输出 vs Flash等待周期      一致     72MHz需LATENCY_2
+
+  ★ 原配置冲突已修复: NVIC_DisableIRQ 已从 EXTI9_5_IRQn 改为 EXTI15_10_IRQn
+               (详见问题3, 2026-04-12修复)
+
+================================================================================
+                        === 文档结束 ===
+================================================================================
